@@ -22,6 +22,27 @@ To work on a local clone instead, add the marketplace by path: `claude plugin ma
 
 ## States
 
+<table>
+<tr>
+<td align="center"><img src="docs/states/idle.svg" width="64" alt="idle"><br>idle</td>
+<td align="center"><img src="docs/states/thinking.svg" width="64" alt="thinking"><br>thinking</td>
+<td align="center"><img src="docs/states/reading.svg" width="64" alt="reading"><br>reading</td>
+<td align="center"><img src="docs/states/searching.svg" width="64" alt="searching"><br>searching</td>
+<td align="center"><img src="docs/states/editing.svg" width="64" alt="editing"><br>editing</td>
+<td align="center"><img src="docs/states/running.svg" width="64" alt="running"><br>running</td>
+<td align="center"><img src="docs/states/browsing.svg" width="64" alt="browsing"><br>browsing</td>
+</tr>
+<tr>
+<td align="center"><img src="docs/states/spawning.svg" width="64" alt="spawning"><br>spawning</td>
+<td align="center"><img src="docs/states/waiting.svg" width="64" alt="waiting"><br>waiting</td>
+<td align="center"><img src="docs/states/working.svg" width="64" alt="working"><br>working</td>
+<td align="center"><img src="docs/states/error.svg" width="64" alt="error"><br>error</td>
+<td align="center"><img src="docs/states/done.svg" width="64" alt="done"><br>done</td>
+<td align="center"><img src="docs/states/compacting.svg" width="64" alt="compacting"><br>compacting</td>
+<td></td>
+</tr>
+</table>
+
 | State | Trigger |
 | --- | --- |
 | thinking | a prompt is submitted |
