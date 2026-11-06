@@ -1,0 +1,13 @@
+{
+  "name": "my-buddy",
+  "description": "A small pixel-art buddy above the prompt that acts out what the session is doing.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cacheTtlMinutes": {
+      "type": "number",
+      "title": "Prompt cache TTL (minutes)",
+      "description": "How long one API response keeps the prompt cache warm: 60 on the 1-hour tier (the default), 5 on the 5-minute tier.",
+      "default": 60
+    }
+  }
+}
