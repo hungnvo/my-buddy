@@ -34,6 +34,6 @@ export type BuddyCache = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null>; cache: Shaped<BuddyCache | null> }
+    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null> }
   }
 }

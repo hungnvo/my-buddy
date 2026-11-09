@@ -11,8 +11,24 @@ const PANE = {
   props: { title: 'Buddy', isFocused: false, bodyColumns: 40, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
 } as const
 
-const boot = async ($: any, on: any, toolResult: any = { result: {} }, surface = 'desktop') => {
+// The session id the process is in; a test changes it to stand for a /clear or a resume.
+const sid = { current: 's1' }
+// How the session is authorized; a test changes it (limits are only remembered on an OAuth login).
+const auth: { current: { handle: string; kind: string } | null } = { current: { handle: 'h', kind: 'bearer' } }
+
+const boot = async ($: any, on: any, toolResult: any = { result: {} }, surface = 'desktop', store: Record<string, unknown> | Map<string, unknown> = {}) => {
+  sid.current = 's1'
+  auth.current = { handle: 'h', kind: 'bearer' }
   const clock = mock.clock(on, { now: 10_000 })
+  if (store instanceof Map) {
+    // A store the test can inspect afterwards.
+    on('store.get', (_: any, e: any) => ({ value: store.get(e.key) }) as any)
+    on('store.set', (_: any, e: any) => (store.set(e.key, e.value), { value: undefined }) as any)
+    on('store.delete', (_: any, e: any) => (store.delete(e.key), { value: undefined }) as any)
+    on('store.keys', () => ({ value: [...store.keys()] }) as any)
+  } else mock.store(on, store)
+  on('session.id', () => ({ value: sid.current }) as any)
+  on('session.authorize', () => ({ value: auth.current }) as any)
   const opened: any[] = []
   on('ui.toast', () => ({ value: undefined }))
   on('command.register', (_: any, e: any) => ({ value: { command: e.name } }) as any)
@@ -692,7 +708,12 @@ test('reset text: 5h clock time, 7d weekday, "next <day>", within 24 h a clock t
   const D = 86_400_000
   const now = 10_010
   const day = (ms: number) => DAYS[new Date(now + ms).getDay()]
-  const at = (kind: string, resetsAt?: unknown) => tmeasure($, [{ kind, percentUsed: 12, ...(resetsAt !== undefined && { resetsAt }) }]).then(() => bandOut($))
+  // The other window is sent bare too, so a reading stored by an earlier call never shows through.
+  const at = (kind: string, resetsAt?: unknown) =>
+    tmeasure($, [
+      { kind: kind === 'five_hour' ? 'seven_day' : 'five_hour', percentUsed: 12 },
+      { kind, percentUsed: 12, ...(resetsAt !== undefined && { resetsAt }) },
+    ]).then(() => bandOut($))
 
   for (const [h, mi, text] of [[15, 40, '3:40 PM'], [0, 5, '12:05 AM'], [12, 0, '12:00 PM']] as const) {
     expect(await at('five_hour', local(2026, 10, 6, h, mi))).toContain(`12% · resets ${text}`)
@@ -802,12 +823,12 @@ test('session.measure updates the band live and passes the event through', async
   let out = await drawn(ui)
   expect(out).toMatch(/ctx 10k · 5%/)
   expect(out).toMatch(/34%/)
-  await tmeasure($, [{ kind: 'five_hour', percentUsed: 41 }])
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 41, resetsAt: RESET }])
   out = await drawn(ui)
   expect(out).toMatch(/41%/)
   expect(out).not.toMatch(/34%|ctx/)
   await tmeasure($, [])
-  expect(await drawn(ui)).toMatch(/engine/)
+  expect(await drawn(ui)).toMatch(/41%/) // an empty reading keeps the known limits
   await ui.unmount()
 })
 
@@ -1393,21 +1414,149 @@ test('session.compact: compacting while it runs, idle and cache line forgotten a
   expect(await bandOut($)).not.toContain(`" ${esc(LABELS.compacting)} "`) // back to idle
 })
 
-test('session.end with reason clear or resume forgets the cache line', async ($, on) => {
+test('session.end clear or resume: the same session id keeps the cache line, a new id hides it until the next response', async ($, on) => {
   stepMocks(on)
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   await boot($, on)
   await reply($)
   expect(await cacheBand($)).toContain('cache 60m')
-  await $.session.end({ reason: 'other', sessionId: 's', resume: {} } as any)
-  expect(await cacheBand($)).toContain('cache 60m') // only a clear or resume forgets
-  for (const reason of ['clear', 'resume']) {
-    await $.session.end({ reason, sessionId: 's', resume: {} } as any)
+  await $.session.end({ reason: 'other', sessionId: 's1', resume: {} } as any)
+  expect(await cacheBand($)).toContain('cache 60m')
+  // A resume that goes on in the same conversation: the line stays, the old context goes, the limits stay.
+  await $.session.end({ reason: 'resume', sessionId: 's1', resume: {} } as any)
+  const kept = await bandOutWith($, { isWorking: false }, 'desktop')
+  expect(kept).toContain('cache 60m')
+  expect(kept).not.toContain('ctx')
+  expect(kept).toContain('5h')
+  // A /clear or a resume into another conversation runs under a new id.
+  for (const [reason, id] of [['clear', 's2'], ['resume', 's3']] as const) {
+    await $.session.end({ reason, sessionId: sid.current, resume: {} } as any)
+    sid.current = id
     const after = await bandOutWith($, { isWorking: false }, 'desktop')
     expect(after).not.toContain('cache')
-    expect(after).not.toContain('ctx') // the old conversation's context is dropped
-    expect(after).toContain('5h') // the limits stay
+    expect(after).not.toContain('ctx')
+    expect(after).toContain('5h')
     await reply($)
-    expect(await cacheBand($)).toContain('cache 60m') // the line comes back after the next response
+    expect(await cacheBand($)).toContain('cache 60m') // the new id's first response stamps it
   }
+  sid.current = 's1'
+  expect(await cacheBand($)).toContain('cache 60m') // s1's stamp is still in the store
+})
+
+test('session.end resume with no tick running: the re-sync alone starts the countdown for the warm stamp', async ($, on) => {
+  stepMocks(on)
+  on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
+  let invalidated = 0
+  on('ui.invalidate', () => {
+    invalidated++
+    return { value: undefined } as any
+  })
+  const clock = await boot($, on, { result: {} }, 'desktop', { 'cacheStamp:s2': { at: 10_000, ttlMs: 3_600_000 } })
+  // No reply on s1 and s1 has no stamp: no cache tick runs yet.
+  await $.session.end({ reason: 'resume', sessionId: 's1', resume: {} } as any)
+  sid.current = 's2'
+  await clock.advance(10) // the re-sync after the switch starts a tick for s2
+  const n = invalidated
+  await clock.advance(2 * 60_000)
+  expect(invalidated).toBeGreaterThan(n)
+})
+
+// ---------------------------------------------------------------- limits survive an empty reading
+
+const RESET = new Date(9_000_000).toISOString() // a stored window needs a reset time to be remembered
+const LIM = [{ kind: 'five_hour', percentUsed: 34, resetsAt: RESET }, { kind: 'seven_day', percentUsed: 12, resetsAt: RESET }]
+const noLive = (on: any) =>
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000 }, rateLimits: [] } }) as any)
+
+test('a fresh session.start with empty live rateLimits shows the stored limits', async ($, on) => {
+  engine(on)
+  noLive(on)
+  await boot($, on, { result: {} }, 'desktop', {
+    lastLimits: [
+      { kind: 'five_hour', percentUsed: 34, resetsAt: new Date(9_000_000).toISOString() },
+      { kind: 'bogus', x: 1 },
+      { kind: 'seven_day', percentUsed: 12 }, // no resetsAt: never used as a fallback
+    ],
+    cacheStamps: { s1: { at: 'x', ttlMs: null }, s2: 7, s3: [] }, // the old layout is ignored
+    'cacheStamp:s1': { at: 'x', ttlMs: null },
+  })
+  const out = await bandOut($)
+  expect(out).toContain('5h')
+  expect(out).toContain('34%')
+  expect(out).not.toContain('7d')
+  expect(out).not.toContain('cache')
+})
+
+test('stored limits show only on a bearer (claude.ai) login, and a logout forgets them', async ($, on) => {
+  engine(on)
+  noLive(on)
+  on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
+  const stored = { lastLimits: [{ kind: 'five_hour', percentUsed: 34, resetsAt: new Date(9_000_000).toISOString() }] }
+  await boot($, on, { result: {} }, 'desktop', stored)
+  expect(await bandOut($)).toContain('34%')
+  auth.current = { handle: 'h', kind: 'api-key' }
+  await $.session.start(SS as any)
+  expect(await bandOut($)).not.toContain('5h')
+  auth.current = null
+  await $.session.start(SS as any)
+  expect(await bandOut($)).not.toContain('5h')
+  auth.current = { handle: 'h', kind: 'bearer' }
+  await $.session.start(SS as any)
+  expect(await bandOut($)).toContain('34%')
+  await $.session.end({ reason: 'logout', sessionId: 's1', resume: {} } as any)
+  await $.session.start(SS as any)
+  expect(await bandOut($)).not.toContain('5h')
+})
+
+test('a stored window whose reset has passed shows 0%', async ($, on) => {
+  engine(on)
+  noLive(on)
+  await boot($, on, { result: {} }, 'desktop', {
+    lastLimits: [{ kind: 'five_hour', percentUsed: 80, resetsAt: new Date(5_000).toISOString() }, { kind: 'seven_day', percentUsed: 12, resetsAt: RESET }],
+  })
+  const out = await bandOut($)
+  expect(out).toContain('0%')
+  expect(out).not.toContain('80%')
+  expect(out).toContain('12%')
+})
+
+test('limits merge per kind: a live 5h with no 7d keeps the stored 7d', async ($, on) => {
+  engine(on)
+  await boot($, on)
+  await tmeasure($, LIM)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 50 }])
+  const out = await bandOut($)
+  expect(out).toContain('50%')
+  expect(out).not.toContain('34%')
+  expect(out).toContain('7d')
+  expect(out).toContain('12%')
+})
+
+test('a stamp already in the store (fresh process) shows the cache line, only for the current id', async ($, on) => {
+  stepMocks(on)
+  const store = new Map<string, unknown>([
+    ['cacheStamp:s1', { at: 20_000, ttlMs: 3_600_000 }],
+    ['cacheStamp:other', { at: 1_000, ttlMs: 1_000 }], // expired
+    ['cacheStamps', { s1: { at: 20_000, ttlMs: 3_600_000 } }], // the old layout is ignored and removed by the next stamp
+  ])
+  await boot($, on, { result: {} }, 'desktop', store)
+  expect(await cacheBand($)).toContain('cache 60m')
+  sid.current = 'zzz'
+  expect(await cacheBand($)).not.toContain('cache')
+  // A stamp prunes only expired stamps of other conversations, and drops the old single-map key.
+  sid.current = 's2'
+  await reply($)
+  expect([...store.keys()].sort()).toEqual(['cacheStamp:s1', 'cacheStamp:s2', 'lastLimits'])
+})
+
+test('/model forgets only the current id: another conversation keeps its stamp', async ($, on) => {
+  stepMocks(on)
+  on('classic.PostModelSwitch', () => ({}) as any)
+  await boot($, on, { result: {} }, 'desktop', { 'cacheStamp:s2': { at: 20_000, ttlMs: 3_600_000 } })
+  await reply($)
+  expect(await cacheBand($)).toContain('cache 60m')
+  await $.classic.PostModelSwitch({} as any)
+  expect(await cacheBand($)).not.toContain('cache')
+  sid.current = 's2'
+  expect(await cacheBand($)).toContain('cache 60m')
 })

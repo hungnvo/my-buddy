@@ -12,8 +12,14 @@ const view = atom({ plugin: 'my-buddy', key: 'view' } as const, { main: 'idle', 
 
 const usage = atom({ plugin: 'my-buddy', key: 'usage' } as const, null as BuddyUsage | null, { shape: 'usage-2' })
 
-// When the main thread's prompt cache was last refreshed, and how long one refresh holds it.
-const cache = atom({ plugin: 'my-buddy', key: 'cache' } as const, null as BuddyCache | null, { shape: 'cache-1' })
+// Persisted in $.store (survives a fresh process): one `cacheStamp:<session id>` key per conversation holds when its
+// main thread last refreshed its prompt cache and how long one refresh holds it (one key each, so two processes never
+// overwrite each other's stamps); `lastLimits` is the last non-empty 5h/7d reading (account-wide, so it is not keyed by
+// session, and only used on an OAuth login).
+const STAMP_PREFIX = 'cacheStamp:'
+const OLD_STAMPS_KEY = 'cacheStamps' // the earlier single-map layout, deleted once
+const LIMITS_KEY = 'lastLimits'
+const MAX_STAMPS = 50 // a sane bound on stamp keys, expired ones go first
 
 const MIN_DWELL_MS = 700
 const DONE_TO_IDLE_MS = 5000
@@ -107,7 +113,10 @@ const meters = (u: BuddyUsage | null, now: number, narrow: boolean): Meter[] => 
       text: `${fmtTokens(tokens)}${pct === undefined ? '' : ` · ${Math.round(pct)}%`}`,
     })
   }
-  for (const l of u.limits ?? []) {
+  for (const raw of u.limits ?? []) {
+    // A window whose reset has passed is empty again, whatever was last read.
+    const reset = raw.resetsAt ? Date.parse(raw.resetsAt) : NaN
+    const l: BuddyLimit = Number.isFinite(reset) && reset <= now ? { kind: raw.kind, percentUsed: 0 } : raw
     const five = l.kind === 'five_hour'
     out.push({
       label: five ? '5h' : '7d',
@@ -248,6 +257,9 @@ let helpersTick: Timer | null = null
 let cacheTick: Timer | null = null
 let cacheGen = 0 // bumped on every stop, so a callback of a cancelled tick cannot re-arm it
 let cachePeriod = 0
+let isBearer: boolean | null = null // whether the session is an OAuth (claude.ai) login; null until read, refreshed at session.start and logout
+let limitsEpoch = 0 // bumped on logout: a measure in flight from before it must not write the old account's limits back
+let pruned = false // stale stamps are pruned once per process (a hot reload resets it)
 let mainRunning = false // between the main turn.start and turn.complete: the cache line is hidden
 let askedUser = false // the main turn put a question to the person: it ends in waiting, not done
 const subTimers = new Map<string, Timer>()
@@ -326,8 +338,48 @@ async function resetLeftovers($: Api) {
   await update($, view, v => ({ ...withDetail(v, 'idle'), demo: false, subs: v.subs.filter(s => s.id !== 'demo-sub') }))
 }
 
+const isStamp = (x: unknown): x is BuddyCache =>
+  !!x && typeof x === 'object' && Number.isFinite((x as BuddyCache).at) && Number.isFinite((x as BuddyCache).ttlMs)
+
+// Old or foreign stored shapes read as absent.
+const readStamp = async ($: Api, sid: string): Promise<BuddyCache | null> => {
+  const raw = await $.store.get(STAMP_PREFIX + sid)
+  return isStamp(raw) ? { at: raw.at, ttlMs: raw.ttlMs } : null
+}
+
+// The stamp of the session the process is in now. The id changes on a /clear or a resume, so it is read every time.
+async function currentCache($: Api): Promise<BuddyCache | null> {
+  try {
+    return await readStamp($, await $.session.id())
+  } catch {
+    return null
+  }
+}
+
+// Deletes the expired stamps of other conversations (and the oldest ones past MAX_STAMPS); never the current id.
+async function pruneStamps($: Api, sid: string, now: number) {
+  const keys = (await $.store.keys()).filter(k => k.startsWith(STAMP_PREFIX) && k !== STAMP_PREFIX + sid)
+  const live: { k: string; at: number }[] = []
+  for (const k of keys) {
+    const st = await readStamp($, k.slice(STAMP_PREFIX.length))
+    if (!st || st.at + st.ttlMs <= now) await $.store.delete(k)
+    else live.push({ k, at: st.at })
+  }
+  live.sort((x, y) => x.at - y.at)
+  for (const { k } of live.slice(0, Math.max(0, live.length + 1 - MAX_STAMPS))) await $.store.delete(k)
+}
+
 async function stampCache($: Api, at: number, ttlMs: number) {
-  await update($, cache, () => ({ at, ttlMs }))
+  const sid = await $.session.id()
+  await $.store.set(STAMP_PREFIX + sid, { at, ttlMs })
+  if (!pruned) {
+    pruned = true
+    await safe(async () => {
+      if ((await $.store.get(OLD_STAMPS_KEY)) !== undefined) await $.store.delete(OLD_STAMPS_KEY)
+      await pruneStamps($, sid, await $.clock.now())
+    })
+  }
+  $.ui.invalidate('ui.render')
   await syncCacheTick($)
 }
 
@@ -338,17 +390,18 @@ function stopCacheTick() {
   cachePeriod = 0
 }
 
-// /clear, /compact and /model start a cold cache: hide the line until the next response.
+// /compact and /model start a cold cache under the same session id: hide the line until the next response.
+// (A /clear or a resume runs under another id, which has no stamp yet.)
 async function forgetCache($: Api) {
   stopCacheTick()
-  await update($, cache, () => null)
+  await $.store.delete(STAMP_PREFIX + (await $.session.id()))
   $.ui.invalidate('ui.render')
 }
 
 // Redraws while the cache is warm (every 5 s in the last 10 minutes, every minute before); stops once it is cold.
 // Drawing hides the line during a turn, so ticks that fire then are harmless.
 async function syncCacheTick($: Api) {
-  const c = await read($, cache)
+  const c = await currentCache($)
   const left = c ? c.at + c.ttlMs - (await $.clock.now()) : 0
   if (left <= 0) return stopCacheTick()
   const period = left > CACHE_FINE_MS ? CACHE_COARSE_TICK_MS : CACHE_TICK_MS
@@ -376,13 +429,49 @@ const limitsOf = (rl: unknown): BuddyLimit[] => {
   return out
 }
 
+// Whether the login is OAuth (`bearer`); an api-key login, no login or any error reads as false. (`identity()` is
+// refused to a mod the organization did not install, so `authorize()` is the check.)
+async function refreshAuth($: Api) {
+  try {
+    isBearer = (await $.session.authorize())?.kind === 'bearer'
+  } catch {
+    isBearer = false
+  }
+}
+
+// An empty reading (off a subscription, or before the first one) never replaces a known one: per window kind, a
+// live reading wins and updates the store, and a missing one falls back to the last stored. The fallback applies only
+// on an OAuth (claude.ai) login (any error reads as no fallback) and skips a stored window with no reset time (it could never expire).
+async function mergeLimits($: Api, rateLimits: unknown): Promise<BuddyLimit[]> {
+  const live = limitsOf(rateLimits)
+  const epoch = limitsEpoch
+  let stored: BuddyLimit[] = []
+  let canFallBack = false
+  try {
+    // Live limits on a non-OAuth reading mean a /login switched it mid-process: read the login again.
+    if (isBearer === null || (isBearer === false && live.length > 0)) await refreshAuth($)
+    canFallBack = isBearer === true
+    if (canFallBack) stored = limitsOf(await $.store.get(LIMITS_KEY))
+  } catch {
+    canFallBack = false
+    stored = []
+  }
+  if (epoch !== limitsEpoch) return live // a logout landed meanwhile: never show the old account's stored limits
+  const fallback = stored.filter(l => l.resetsAt !== undefined)
+  const merged = limitsOf([...live, ...fallback]) // limitsOf takes the first of each kind: live first
+  if (canFallBack && epoch === limitsEpoch && live.length > 0 && JSON.stringify(merged) !== JSON.stringify(stored)) {
+    await safe(() => $.store.set(LIMITS_KEY, merged))
+  }
+  return merged
+}
+
 // Writes only when the reading changed.
 async function setUsage($: Api, ctx: Omit<BuddyUsage, 'limits'> & { limits?: BuddyLimit[] }, rateLimits: unknown) {
   const next: BuddyUsage = {
     window: ctx.window,
     ...(ctx.tokens !== undefined && { tokens: ctx.tokens }),
     ...(ctx.percent !== undefined && { percent: ctx.percent }),
-    limits: limitsOf(rateLimits),
+    limits: await mergeLimits($, rateLimits),
   }
   await update($, usage, cur =>
     cur &&
@@ -498,6 +587,7 @@ export const register: Register = (on, options) => {
     await safe(() => $.command.register({ name: 'buddy', description: 'Open the buddy pane' }))
     // A reload runs this again with the stored view but fresh timers: clear leftover demo state.
     await safe(() => resetLeftovers($))
+    await refreshAuth($)
     await safe(() => rescueHelpers($))
     await safe(() => seedUsage($))
     await safe(() => syncCacheTick($))
@@ -607,8 +697,15 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') {
       // usage() still reads the ending conversation here (an in-session /resume gets no session.start after it): drop its context, keep the limits; the next measure refills it.
+      // The cache line needs no forgetting: stamps are keyed by session id. But no session.start follows, so once the id
+      // has switched, re-sync the tick: the new conversation may hold a warm stamp (a resume) the old tick never drew.
       await safe(() => update($, usage, u => u && { ...u, tokens: undefined, percent: undefined }))
-      await safe(() => forgetCache($))
+      $.clock.after(0, () => void safe(() => syncCacheTick($)))
+    }
+    if (e.reason === 'logout') {
+      limitsEpoch++
+      await safe(() => $.store.delete(LIMITS_KEY))
+      isBearer = null // re-read lazily: the credential may not be gone yet, and a new login may follow
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -645,7 +742,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const v = await read($, view)
     const u = await read($, usage)
-    const c = await read($, cache)
+    const c = await currentCache($)
     if (e.props.hasSurvey) return next(e)
     const narrow = (e.props.bodyColumns ?? Infinity) < NARROW_COLUMNS
     let rows = meters(u, await $.clock.now(), narrow)
@@ -736,7 +833,7 @@ export const register: Register = (on, options) => {
   // The pane is on request only (/buddy); docked beside the chat, inline above the prompt when the surface has no dock.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const v = await read($, view)
-    const line = mainRunning ? null : cacheLine(await read($, cache), await $.clock.now())
+    const line = mainRunning ? null : cacheLine(await currentCache($), await $.clock.now())
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
       return (
