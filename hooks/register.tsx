@@ -396,6 +396,12 @@ async function setUsage($: Api, ctx: Omit<BuddyUsage, 'limits'> & { limits?: Bud
 }
 
 // Re-reads the live reading; a tokens-less one drops the stored tokens.
+// An auto-compaction mid-turn goes back to thinking, not idle; a /compact between turns goes idle.
+async function afterCompact($: Api) {
+  if (mainRunning) await setMain($, 'thinking')
+  else await toIdle($)
+}
+
 async function seedUsage($: Api) {
   const live = await $.session.usage()
   await setUsage($, live.context, live.rateLimits)
@@ -536,6 +542,13 @@ export const register: Register = (on, options) => {
     if (!e.agentId) {
       mainRunning = true
       $.ui.invalidate('ui.render')
+    } else {
+      // A subagent's first turn (same as classic.SubagentStart); a resumed one must not be dropped by its old timer.
+      const id = e.agentId
+      subTimers.get(id)?.cancel()
+      subTimers.delete(id)
+      await safe(() => setSub($, id, 'working'))
+      await safe(() => syncHelpers($))
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -571,6 +584,35 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // Native twins of the classic PreCompact/PostCompact and SessionStart(clear) hooks below; both sets stay, resets are idempotent.
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId || e.trigger === 'precompute') return next(e)
+    await safe(() => setMain($, 'compacting'))
+    let result
+    try {
+      result = await next(e)
+    } catch (err) {
+      await safe(() => afterCompact($))
+      throw err
+    }
+    if (result && 'skip' in result && result.skip !== undefined) await safe(() => afterCompact($))
+    else {
+      await safe(() => afterCompact($))
+      await safe(() => seedUsage($))
+      await safe(() => forgetCache($))
+    }
+    return result
+  }).catch(($, e, next) => next(e)) // replay-safe: never runs the compaction a second time
+
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      // usage() still reads the ending conversation here: drop its context, keep the limits; the next measure refills it.
+      await safe(() => update($, usage, u => u && { ...u, tokens: undefined, percent: undefined }))
+      await safe(() => forgetCache($))
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('classic.SubagentStart', async ($, e, next) => {
     await safe(() => setSub($, e.agent_id, 'working'))
     await safe(() => syncHelpers($))
@@ -594,7 +636,7 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
   on('classic.PostCompact', async ($, e, next) => {
-    await safe(() => toIdle($))
+    await safe(() => afterCompact($))
     await safe(() => seedUsage($))
     await safe(() => forgetCache($))
     return next(e)

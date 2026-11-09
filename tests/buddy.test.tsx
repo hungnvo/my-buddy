@@ -1382,3 +1382,63 @@ test('/clear and /model forget the cache: the line hides until the next response
   await $.classic.PostModelSwitch({} as any)
   expect(await cacheBand($)).not.toContain('cache')
 })
+
+// ---------------------------------------------------------------- native events (classic hooks may be blocked)
+
+test('turn.start with an agentId shows the helper before any tool call; a resumed one survives its old drop timer', async ($, on) => {
+  stepMocks(on)
+  const clock = await boot($, on)
+  const ui = await mountPane($)
+  await $.turn.start({ text: 'x', turnId: 's1', agentId: 'a1' } as any)
+  expect(await drawn(ui)).toContain(`subagent buddy, ${LABELS.working}`)
+  expect(count(await drawn(ui))).toBe(2)
+  await $.turn.complete(done('a1', 's1')) // schedules the drop in 5 s
+  await clock.advance(3000)
+  await $.turn.start({ text: 'again', turnId: 's2', agentId: 'a1' } as any) // resumed
+  await clock.advance(3000) // past the first timer
+  const out = await drawn(ui)
+  expect(count(out)).toBe(2)
+  expect(out).toContain(`subagent buddy, ${LABELS.working}`)
+  await ui.unmount()
+})
+
+const MSGS = [{ role: 'user', text: 'hi', toolUses: [] }]
+
+test('session.compact: compacting while it runs, idle and cache line forgotten after; precompute and subagent do nothing', async ($, on) => {
+  stepMocks(on)
+  const during: Record<string, string> = {}
+  let clock: any
+  on('session.compact', async (_: any, e: any) => {
+    await clock.advance(800) // state changes hold briefly
+    during[e.agentId ?? e.trigger] = await bandOut($)
+    return { messages: [{ role: 'user', text: 'summary', toolUses: [] }] } as any
+  })
+  clock = await boot($, on)
+  await reply($)
+  expect(await cacheBand($)).toContain('cache 60m')
+  await $.session.compact({ trigger: 'precompute', messages: MSGS } as any)
+  await $.session.compact({ trigger: 'auto', agentId: 'a1', messages: MSGS } as any)
+  expect(during.precompute).not.toContain(`" ${esc(LABELS.compacting)} "`)
+  expect(during.a1).not.toContain(`" ${esc(LABELS.compacting)} "`)
+  expect(await cacheBand($)).toContain('cache') // untouched (clock moved a little)
+  await $.session.compact({ trigger: 'manual', messages: MSGS } as any)
+  hasLabel(during.manual, LABELS.compacting)
+  expect(await cacheBand($)).not.toContain('cache')
+  await clock.advance(800)
+  expect(await bandOut($)).not.toContain(`" ${esc(LABELS.compacting)} "`) // back to idle
+})
+
+test('session.end with reason clear forgets the cache line', async ($, on) => {
+  stepMocks(on)
+  on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
+  await boot($, on)
+  await reply($)
+  expect(await cacheBand($)).toContain('cache 60m')
+  await $.session.end({ reason: 'other', sessionId: 's', resume: {} } as any)
+  expect(await cacheBand($)).toContain('cache 60m') // only a clear forgets
+  await $.session.end({ reason: 'clear', sessionId: 's', resume: {} } as any)
+  const after = await bandOutWith($, { isWorking: false }, 'desktop')
+  expect(after).not.toContain('cache')
+  expect(after).not.toContain('ctx') // the old conversation's context is dropped
+  expect(after).toContain('5h') // the limits stay
+})
