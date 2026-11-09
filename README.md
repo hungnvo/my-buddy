@@ -75,7 +75,7 @@ Reset times are local clock times, so they never go stale between turns. The 7-d
 
 Under the buddy's label (and in the `/buddy` pane) a `cache 4:12` line counts down the prompt cache of the main conversation, which every main-thread API response refreshes: `m:ss` under 10 minutes, `42m` after, yellow under 60 s, red `cache cold` once expired; it is hidden before the first response and while a turn runs (a permission prompt mid-turn included), and on the terminal it shares the label row (`label · cache 4:12`) unless the meters take two rows or more. The cache lifetime is the `cacheTtlMinutes` plugin option (default 60, the 1-hour cache; set 5 if your sessions use the 5-minute cache), since the API usage the mod sees does not say which tier was written.
 
-Subagents get their own smaller buddies next to the main one, driven by their own tool calls. A subagent is dropped when it stops, or 5 s after its last turn.
+Subagents get their own smaller buddies next to the main one, driven by their own tool calls. A subagent is dropped 5 s after its last turn, or sooner when the main turn ends; one that goes quiet for 10 minutes is dropped too.
 
 ## Development
 

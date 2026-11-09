@@ -75,10 +75,10 @@ const turnMocks = (on: any) => {
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'ok' }))
   on('prompt.submit', (_: any, e: any) => ({ text: e.text }) as any)
-  on('classic.PostCompact', () => ({}) as any)
 }
 const done = (agentId?: string, turnId = 't1') =>
   ({ ...(agentId && { agentId }), reason: 'answer', answer: 'ok', turnId }) as any
+const subStart = ($: any, id: string) => $.turn.start({ text: 'x', turnId: id, agentId: id } as any)
 const sub = (agentId: string, tool = 'Read', extra: object = {}) => ({ tool, file_path: '/x', agentId, ...extra }) as any
 
 const measure = ($: any, context: any, rateLimits: any[] = []) => $.session.measure({ context, rateLimits, changed: [] } as any)
@@ -254,34 +254,25 @@ test('a quick burst is held for the minimum dwell, then the last state shows', a
   await ui.unmount()
 })
 
-test('PermissionRequest shows waiting, PreCompact compacting, PostCompact back to idle', async ($, on) => {
+test('PermissionRequest shows waiting', async ($, on) => {
   engine(on)
-  for (const name of ['PermissionRequest', 'PreCompact', 'PostCompact']) on(`classic.${name}` as any, () => ({}) as any)
+  on('classic.PermissionRequest', () => ({}) as any)
   const clock = await boot($, on)
   await clock.advance(800)
   await $.classic.PermissionRequest({} as any)
   await clock.advance(800)
   hasLabel(await bandOut($), LABELS.waiting)
-  await $.classic.PreCompact({} as any)
-  await clock.advance(800)
-  hasLabel(await bandOut($), LABELS.compacting)
-  await $.classic.PostCompact({} as any)
-  await clock.advance(800)
-  const out = await bandOut($)
-  expect(count(out)).toBe(0)
-  expect(out).toMatch(/engine/)
 })
 
 // ---------------------------------------------------------------- subagents
 
 test('a subagent starts, follows its own tool calls, finishes with done and is dropped', async ($, on) => {
+  on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'ok' }))
-  on('classic.SubagentStart', () => ({}) as any)
-  on('classic.SubagentStop', () => ({}) as any)
   const clock = await boot($, on)
   const ui = await mountPane($)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
-  let out = await drawn(ui)
+  await subStart($, 's1')
+  const out = await drawn(ui)
   expect(count(out)).toBe(2)
   expect(out).toContain(`subagent buddy, ${LABELS.working}`)
   await $.tool.call(sub('s1', 'Edit'))
@@ -292,11 +283,6 @@ test('a subagent starts, follows its own tool calls, finishes with done and is d
   expect(count(await drawn(ui))).toBe(2)
   await clock.advance(1500)
   expect(count(await drawn(ui))).toBe(1)
-  await $.classic.SubagentStart({ agent_id: 's2' } as any)
-  expect(count(await drawn(ui))).toBe(2)
-  await $.classic.SubagentStop({ agent_id: 's2' } as any)
-  out = await drawn(ui)
-  expect(count(out)).toBe(1)
   await ui.unmount()
 })
 
@@ -376,8 +362,6 @@ test('the band is hidden when idle, shows for a running sub, and a finished sub 
 
 const helperMocks = (on: any) => {
   turnMocks(on)
-  on('classic.SubagentStart', () => ({}) as any)
-  on('classic.SubagentStop', () => ({}) as any)
 }
 
 test('background subs: main turn ends, then shows working on 1 helper instead of idle', async ($, on) => {
@@ -404,7 +388,7 @@ test('waiting for you wins over helpers, through sub events and ticks', async ($
   await $.turn.complete(done())
   await clock.advance(10_000)
   hasLabel(await bandOut($), LABELS.waiting)
-  await $.classic.SubagentStart({ agent_id: 's2' } as any)
+  await subStart($, 's2')
   await $.turn.complete(done('s1'))
   await clock.advance(70_000)
   hasLabel(await bandOut($), LABELS.waiting)
@@ -419,7 +403,7 @@ test('the helpers count follows the active subs', async ($, on) => {
   await $.tool.call(sub('s1'))
   await clock.advance(800)
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
-  await $.classic.SubagentStart({ agent_id: 's2' } as any)
+  await subStart($, 's2')
   hasLabel(await bandOut($), `${LABELS.working} on 2 helpers`)
   await $.turn.complete(done('s1'))
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
@@ -428,7 +412,7 @@ test('the helpers count follows the active subs', async ($, on) => {
 test('the last sub finishing ends the helpers state: done, then idle after 5 s', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
   await $.turn.complete(done('s1'))
@@ -441,7 +425,7 @@ test('the last sub finishing ends the helpers state: done, then idle after 5 s',
 test('a main prompt.submit overrides the helpers state', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   await $.prompt.submit({ text: 'hi' } as any)
   await clock.advance(800)
@@ -451,21 +435,21 @@ test('a main prompt.submit overrides the helpers state', async ($, on) => {
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
 })
 
-test('SubagentStart while main is idle enters the helpers state', async ($, on) => {
+test("a subagent's turn.start while main is idle enters the helpers state", async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
   expect(count(await bandOut($))).toBe(0)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(10)
   const out = await bandOut($)
   hasLabel(out, `${LABELS.working} on 1 helper`)
   expect(count(out)).toBe(2)
 })
 
-test('main activity during helpers, then its turn ends: done, then back to helpers while the sub runs; SubagentStop of the last sub ends it', async ($, on) => {
+test('main activity during helpers, then its turn ends: done, then back to helpers while the sub runs; the last sub finishing ends it', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   await $.tool.call({ tool: 'Bash', command: 'make' } as any)
   await clock.advance(800)
@@ -475,7 +459,7 @@ test('main activity during helpers, then its turn ends: done, then back to helpe
   hasLabel(await bandOut($), LABELS.done)
   await clock.advance(5000)
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
-  await $.classic.SubagentStop({ agent_id: 's1' } as any) // no turn.complete
+  await $.turn.complete(done('s1', 't3'))
   await clock.advance(800)
   hasLabel(await bandOut($), LABELS.done)
   await clock.advance(5000)
@@ -499,10 +483,10 @@ test('a sub that errors stays counted as a helper until it finishes', async ($, 
 test('helpers state never appears during /buddy-demo', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   await run($, 'buddy-demo')
-  await $.classic.SubagentStart({ agent_id: 's2' } as any)
+  await subStart($, 's2')
   await $.tool.call(sub('s2'))
   for (let i = 0; i < 12; i++) {
     await clock.advance(2500)
@@ -526,7 +510,7 @@ test('a sub quiet for 40 s still counts when the main turn completes', async ($,
 test('a sub that went silent for over 10 min while in helpers is rescued: done, then idle', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
   await clock.advance(660_000)
@@ -538,7 +522,7 @@ test('a sub that went silent for over 10 min while in helpers is rescued: done, 
 test('after prompt.submit, minutes of ticks never flip main back to helpers', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   await $.prompt.submit({ text: 'hi' } as any)
   await clock.advance(800)
@@ -549,7 +533,7 @@ test('after prompt.submit, minutes of ticks never flip main back to helpers', as
 test('a second session.start (hot reload) with an active sub re-enters helpers', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(800)
@@ -561,7 +545,7 @@ test('a deferred thinking is not overwritten by a sub event within the dwell', a
   const clock = await boot($, on)
   await clock.advance(800)
   await $.prompt.submit({ text: 'hi' } as any)
-  await $.classic.SubagentStart({ agent_id: 's1' } as any)
+  await subStart($, 's1')
   await clock.advance(800)
   hasLabel(await bandOut($), LABELS.thinking)
 })
@@ -837,9 +821,10 @@ test('session.start seeds ctx and limits from $.session.usage()', async ($, on) 
   expect(out).toMatch(/8%/)
 })
 
-test('a second session.start, classic.SessionStart, PostCompact, PostModelSwitch and prompt.submit re-seed the reading', async ($, on) => {
+test('a second session.start, session.compact, PostModelSwitch and prompt.submit re-seed the reading', async ($, on) => {
   engine(on)
-  for (const name of ['SessionStart', 'PostCompact', 'PostModelSwitch']) on(`classic.${name}` as any, () => ({}) as any)
+  on('classic.PostModelSwitch', () => ({}) as any)
+  on('session.compact', () => ({ messages: MSGS }) as any)
   on('prompt.submit', (_: any, e: any) => ({ text: e.text }) as any)
   const ctx = { current: { tokens: 10_000, window: 200_000, percent: 5 } }
   liveUsage(on, ctx)
@@ -847,8 +832,7 @@ test('a second session.start, classic.SessionStart, PostCompact, PostModelSwitch
   expect(await bandOut($)).toMatch(/ctx 10k/)
   const fires = [
     () => $.session.start({ ...SS }),
-    () => $.classic.SessionStart({ source: 'resume' } as any),
-    () => $.classic.PostCompact({} as any),
+    () => $.session.compact({ trigger: 'manual', messages: MSGS } as any),
     () => $.classic.PostModelSwitch({} as any),
     () => $.prompt.submit({ text: 'hi' } as any),
   ]
@@ -858,20 +842,6 @@ test('a second session.start, classic.SessionStart, PostCompact, PostModelSwitch
     await fire()
     expect(await bandOut($)).toMatch(new RegExp(`ctx ${tokens / 1000}k · 6%`))
   }
-})
-
-test('classic.SessionStart (clear) with a tokens-less reading hides the idle band', async ($, on) => {
-  engine(on)
-  on('classic.SessionStart', () => ({}) as any)
-  const ctx = { current: { tokens: 42_000, window: 200_000, percent: 21 } as any }
-  liveUsage(on, ctx)
-  await boot($, on)
-  expect(await bandOut($)).toMatch(/ctx 42k/)
-  ctx.current = { window: 200_000 }
-  await $.classic.SessionStart({ source: 'clear' } as any)
-  const out = await bandOut($)
-  expect(out).toMatch(/engine/)
-  expect(out).not.toMatch(/ctx/)
 })
 
 test('a $.session.usage() that throws does not break session.start, prompt.submit or measure', async ($, on) => {
@@ -1368,15 +1338,10 @@ test('the tick runs every minute above 10 minutes left and every 5 s below', asy
   expect(invalidated - n).toBeGreaterThanOrEqual(5) // fine period: ~6 ticks in 30 s
 })
 
-test('/clear and /model forget the cache: the line hides until the next response', async ($, on) => {
+test('/model forgets the cache: the line hides until the next response', async ($, on) => {
   stepMocks(on)
-  on('classic.SessionStart', () => ({}) as any)
   on('classic.PostModelSwitch', () => ({}) as any)
   await boot($, on)
-  await reply($)
-  expect(await cacheBand($)).toContain('cache 60m')
-  await $.classic.SessionStart({ source: 'clear' } as any)
-  expect(await cacheBand($)).not.toContain('cache')
   await reply($)
   expect(await cacheBand($)).toContain('cache 60m')
   await $.classic.PostModelSwitch({} as any)
@@ -1428,17 +1393,21 @@ test('session.compact: compacting while it runs, idle and cache line forgotten a
   expect(await bandOut($)).not.toContain(`" ${esc(LABELS.compacting)} "`) // back to idle
 })
 
-test('session.end with reason clear forgets the cache line', async ($, on) => {
+test('session.end with reason clear or resume forgets the cache line', async ($, on) => {
   stepMocks(on)
   on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
   await boot($, on)
   await reply($)
   expect(await cacheBand($)).toContain('cache 60m')
   await $.session.end({ reason: 'other', sessionId: 's', resume: {} } as any)
-  expect(await cacheBand($)).toContain('cache 60m') // only a clear forgets
-  await $.session.end({ reason: 'clear', sessionId: 's', resume: {} } as any)
-  const after = await bandOutWith($, { isWorking: false }, 'desktop')
-  expect(after).not.toContain('cache')
-  expect(after).not.toContain('ctx') // the old conversation's context is dropped
-  expect(after).toContain('5h') // the limits stay
+  expect(await cacheBand($)).toContain('cache 60m') // only a clear or resume forgets
+  for (const reason of ['clear', 'resume']) {
+    await $.session.end({ reason, sessionId: 's', resume: {} } as any)
+    const after = await bandOutWith($, { isWorking: false }, 'desktop')
+    expect(after).not.toContain('cache')
+    expect(after).not.toContain('ctx') // the old conversation's context is dropped
+    expect(after).toContain('5h') // the limits stay
+    await reply($)
+    expect(await cacheBand($)).toContain('cache 60m') // the line comes back after the next response
+  }
 })

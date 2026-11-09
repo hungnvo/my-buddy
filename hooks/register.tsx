@@ -17,7 +17,7 @@ const cache = atom({ plugin: 'my-buddy', key: 'cache' } as const, null as BuddyC
 
 const MIN_DWELL_MS = 700
 const DONE_TO_IDLE_MS = 5000
-const STALE_SUB_MS = 600_000 // a rescue for lost SubagentStop/turn.complete events, so longer than any one tool call
+const STALE_SUB_MS = 600_000 // a rescue for lost subagent turn.complete events, so longer than any one tool call
 const HELPERS_TICK_MS = 60_000
 const CACHE_TICK_MS = 5000
 const CACHE_WARN_MS = 60_000
@@ -445,7 +445,7 @@ async function syncHelpers($: Api) {
   }
 }
 
-// A sub whose stop event was lost never ends the helpers state by itself.
+// A sub whose turn.complete was lost never ends the helpers state by itself.
 async function rescueHelpers($: Api) {
   await safe(() => pruneSubs($))
   await safe(() => syncHelpers($))
@@ -543,7 +543,7 @@ export const register: Register = (on, options) => {
       mainRunning = true
       $.ui.invalidate('ui.render')
     } else {
-      // A subagent's first turn (same as classic.SubagentStart); a resumed one must not be dropped by its old timer.
+      // A subagent's first turn; a resumed one must not be dropped by its old timer.
       const id = e.agentId
       subTimers.get(id)?.cancel()
       subTimers.delete(id)
@@ -584,7 +584,7 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // Native twins of the classic PreCompact/PostCompact and SessionStart(clear) hooks below; both sets stay, resets are idempotent.
+  // Compaction: compacting while it runs, then idle, a fresh reading and a forgotten cache line (session.start does not fire after it).
   on('session.compact', async ($, e, next) => {
     if (e.agentId || e.trigger === 'precompute') return next(e)
     await safe(() => setMain($, 'compacting'))
@@ -605,46 +605,20 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e)) // replay-safe: never runs the compaction a second time
 
   on('session.end', async ($, e, next) => {
-    if (e.reason === 'clear') {
-      // usage() still reads the ending conversation here: drop its context, keep the limits; the next measure refills it.
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      // usage() still reads the ending conversation here (an in-session /resume gets no session.start after it): drop its context, keep the limits; the next measure refills it.
       await safe(() => update($, usage, u => u && { ...u, tokens: undefined, percent: undefined }))
       await safe(() => forgetCache($))
     }
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('classic.SubagentStart', async ($, e, next) => {
-    await safe(() => setSub($, e.agent_id, 'working'))
-    await safe(() => syncHelpers($))
-    return next(e)
-  }).catch(($, e, next) => next(e))
-  on('classic.SubagentStop', async ($, e, next) => {
-    await safe(() => dropSub($, e.agent_id))
-    await safe(() => syncHelpers($))
-    return next(e)
-  }).catch(($, e, next) => next(e))
   on('classic.PermissionRequest', async ($, e, next) => {
     const aid = e.agent_id
     if (aid) {
       await safe(() => setSub($, aid, 'waiting'))
       await safe(() => syncHelpers($))
     } else await safe(() => setMain($, 'waiting'))
-    return next(e)
-  }).catch(($, e, next) => next(e))
-  on('classic.PreCompact', async ($, e, next) => {
-    await safe(() => setMain($, 'compacting'))
-    return next(e)
-  }).catch(($, e, next) => next(e))
-  on('classic.PostCompact', async ($, e, next) => {
-    await safe(() => afterCompact($))
-    await safe(() => seedUsage($))
-    await safe(() => forgetCache($))
-    return next(e)
-  }).catch(($, e, next) => next(e))
-  // startup, resume, clear, compact and fork: session.start does not fire on /clear.
-  on('classic.SessionStart', async ($, e, next) => {
-    await safe(() => seedUsage($))
-    if (e.source === 'clear' || e.source === 'compact') await safe(() => forgetCache($))
     return next(e)
   }).catch(($, e, next) => next(e))
   // /model changes the window, so the percent, and starts a cold cache.
