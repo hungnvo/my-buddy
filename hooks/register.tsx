@@ -556,7 +556,7 @@ async function onBash($: Api, e: unknown, result: unknown) {
   const failed = !!r?.isError
   const text = typeof r?.text === 'string' ? r.text : undefined
   if (!failed && isPrCreate(cmd) && prOutput(text)) await earn($, ['pr'])
-  else if (!failed && isCommit(cmd) && commitOutput(text)) await earn($, ['commit', 'firstCommit'])
+  else if (!failed && isCommit(cmd) && commitOutput(text, cmd)) await earn($, ['commit', 'firstCommit'])
   if (isTestCmd(cmd)) {
     const key = `${await $.session.id()}|${squash(cmd)}`
     if (failed) {

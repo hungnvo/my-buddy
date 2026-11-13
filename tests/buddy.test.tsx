@@ -2487,3 +2487,15 @@ test('xp: the coming-back bonus is capped at 5 a day', async ($, on) => {
   }
   expect(xpSum(st)).toBe(10)
 })
+
+test('xp: a quiet commit counts unless git had nothing to commit', async ($, on) => {
+  const st = new Map<string, unknown>()
+  const c = await levelBoot($, on, st)
+  await bash(c, $, 'git commit -q -m x', { result: {}, text: '' })
+  expect(xpSum(st)).toBe(15)
+  await bash(c, $, 'git add . && git commit --quiet -F - && git log --oneline -1', { result: {}, text: 'ca82e55 msg' })
+  expect(xpSum(st)).toBe(20)
+  await bash(c, $, 'git commit -q -m y', { result: {}, text: 'nothing to commit, working tree clean' })
+  await bash(c, $, 'git commit -m z', { result: {}, text: 'ok' })
+  expect(xpSum(st)).toBe(20)
+})

@@ -157,15 +157,23 @@ const CMD = String.raw`(?:^|[\s;&|(])`
 const GIT_COMMIT = new RegExp(`${CMD}git\\s+(?:(?:-[Cc]\\s+\\S+|--?[\\w-]+(?:=\\S+)?)\\s+)*commit(?:\\s|$)`)
 // Quoted strings are blanked, so a flag or word inside a message or title is not read as an argument.
 const unquoted = (cmd: string) => cmd.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '""')
-export const isCommit = (cmd: string) => {
+// The commit command's own segment (quotes blanked), up to the next ; && || | & or newline.
+const commitSeg = (cmd: string) => {
   const c = unquoted(cmd)
   const m = GIT_COMMIT.exec(c)
-  if (!m) return false
-  const seg = c.slice(m.index).replace(/^[\s;&|(]/, '').split(/;|&&|\|\||\||&|\n/)[0]!
-  return !/(?:^|\s)--amend(?:[\s=]|$)/.test(seg)
+  return m ? c.slice(m.index).replace(/^[\s;&|(]/, '').split(/;|&&|\|\||\||&|\n/)[0]! : null
 }
-// `[branch abc1234] message`, git's own line after a commit
-export const commitOutput = (text: string | undefined) => text === undefined || /\[[^\]\n]+ [0-9a-f]{7,}\]/.test(text)
+export const isCommit = (cmd: string) => {
+  const seg = commitSeg(cmd)
+  return seg !== null && !/(?:^|\s)--amend(?:[\s=]|$)/.test(seg)
+}
+// `[branch abc1234] message`, git's own line after a commit. A quiet commit (-q, --quiet) prints nothing, so it
+// counts unless git said there was nothing to commit (the call itself did not fail).
+export const commitOutput = (text: string | undefined, cmd = '') => {
+  if (text === undefined || /\[[^\]\n]+ [0-9a-f]{7,}\]/.test(text)) return true
+  const seg = commitSeg(cmd)
+  return seg !== null && /(?:^|\s)(?:-q|--quiet)(?=\s|$)/.test(seg) && !/nothing (?:added )?to commit/i.test(text)
+}
 // A pull request is only made when `gh pr create` ran for real: no --help, --web or --dry-run among its arguments.
 const PR_CREATE = new RegExp(`${CMD}gh\\s+pr\\s+create(?=\\s|$)([^;&|\\n]*)`)
 export const isPrCreate = (cmd: string) => {
