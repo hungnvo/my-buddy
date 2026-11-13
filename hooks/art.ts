@@ -1,4 +1,4 @@
-import type { BuddyState } from '../types'
+import type { BuddyLook, BuddyState } from '../types'
 
 export const LABELS: Record<BuddyState, string> = {
   idle: 'idle', thinking: 'thinking...', reading: 'reading', searching: 'searching',
@@ -17,12 +17,14 @@ const PALETTES = [
   { body: '#ffd166', hi: '#ffe8a8', cheek: '#ff8f70' }, // yellow
   { body: '#c3a6f0', hi: '#e1d3fa', cheek: '#ff8fbf' }, // violet
 ] as const
-type Palette = (typeof PALETTES)[number]
+type Palette = { body: string; hi: string; cheek: string }
 
 const C: Record<string, string> = {
   k: '#3b2a3a', w: '#ffffff', g: '#8d8d9b', G: '#6a6a80', y: '#ffd166', b: '#6bb5ff', B: '#3d85d8',
   r: '#ef476f', n: '#a0673b', t: '#d9a066', d: '#7a4a24', l: '#e8e8f0', f: '#f08fb0',
+  R: '#b5223f', e: '#52b788', E: '#2d6a4f', o: '#ff9f1c', O: '#e07a00', m: '#ff8fab', u: '#2b3a67', i: '#ffe3b3',
 }
+const GOLD: Palette = { body: '#ffd54a', hi: '#fff0a0', cheek: '#ff9f5a' }
 type Px = [number, number, string]
 type Frame = { dx?: number; dy?: number; eyes?: string; mouth?: string; props?: Px[]; behind?: Px[] }
 type Anim = { ms: number; frames: Frame[] }
@@ -201,12 +203,44 @@ const bodyPx = (p: Palette, f: Frame): Px[] => {
   return out
 }
 
-const frameSvg = (p: Palette, f: Frame): string => {
+// Accessories of the main buddy, on the same 16x16 grid and drawn over the body. A hat is rows of sprite chars whose
+// last row lands on the head's top outline (y 4); ox is its left column.
+const BOW: Px[] = [
+  ...dots('r', [5, 12], [10, 12], [5, 14], [10, 14]), ...spr(['rrRRrr'], 5, 13),
+]
+const HATS: [number, string[]][] = [
+  [4, ['...yy...', '...bb...', '..bwwb..', 'bbwbbwbb']], // Jan party hat
+  [4, ['........', 'r.r..r.r', '.r....r.', 'mmmmmmmm']], // Feb heart headband
+  [4, ['.ee..ee.', '..eeee..', '....E...', '....E...']], // Mar clover sprout
+  [4, ['..yyyy..', '.ywyyyy.', 'yyyyyyyy', 'oooooooo']], // Apr rain hood
+  [4, ['........', '.m..w.m.', 'EmEEwEmE', '........']], // May flower crown
+  [4, ['........', '........', 'kkkkkkkk', 'kBBkkBBk']], // Jun sunglasses pushed up
+  [4, ['..eEEe..', '.rryrrr.', '.rrrryr.', '..rRRr..']], // Jul strawberry
+  [2, ['............', '....tttt....', '...trrrrt...', 'nnnnnnnnnnnn']], // Aug sun hat
+  [2, ['...uuuuuu...', 'uuuuuuuuuuuy', '...uuuuuu..y', '...uuuuuu..y']], // Sep graduation cap
+  [4, ['...ee...', '.oooooo.', 'ookookoo', 'oooooooo']], // Oct pumpkin hat
+  [4, ['...ww...', '..bbbb..', '.bbbbbb.', 'BbBbBbBb']], // Nov knit beanie
+  [4, ['......ww', '..rrrrr.', '.rrrrrr.', 'wwwwwwww']], // Dec snow cap
+]
+const SPARKS: Px[][] = [dots('o', [0, 2], [14, 1]), dots('o', [1, 12], [15, 4]), dots('o', [0, 7], [14, 13]), dots('o', [15, 9], [1, 3])]
+
+const accessories = (look: BuddyLook, f: Frame): Px[] => {
+  const dx = f.dx ?? 0, dy = f.dy ?? 0
+  const out: Px[] = []
+  if (look.level >= 2) out.push(...BOW.map(([x, y, c]): Px => [x + dx, y + dy, c]))
+  const hat = look.level >= 3 ? HATS[look.month % HATS.length] : undefined
+  // The hat rises with a jump but never out of the frame: it sinks into the head instead.
+  if (hat) out.push(...spr(hat[1], hat[0] + dx, 1 + Math.max(dy, -1)))
+  return out
+}
+
+const frameSvg = (p: Palette, f: Frame, look?: BuddyLook, i = 0): string => {
   const col = (ch: string) => ch === 'p' ? p.body : ch === 'h' ? p.hi : ch === 'c' ? p.cheek : ch === 's' ? p.body : (C[ch] ?? '#000')
   const dx = f.dx ?? 0, dy = f.dy ?? 0
   const body = bodyPx(p, f).map(([x, y, c]): Px => [x + dx, y + dy, c])
   const grid = new Map<string, string>()
-  for (const [x, y, c] of [...body, ...(f.props ?? [])]) {
+  const sparks = look && look.level >= 4 ? SPARKS[i % SPARKS.length]! : []
+  for (const [x, y, c] of [...sparks, ...body, ...(look ? accessories(look, f) : []), ...(f.props ?? [])]) {
     if (x >= -4 && x < 20 && y >= -4 && y < 20) grid.set(`${x},${y}`, col(c))
   }
   // merge horizontal runs, one <path> per colour
@@ -229,8 +263,8 @@ const frameSvg = (p: Palette, f: Frame): string => {
 }
 
 /** The whole SVG document for one buddy in one state. Frames are toggled with CSS steps. */
-export const buddySvg = (state: BuddyState, palette: number, px: number): string => {
-  const p = PALETTES[palette % PALETTES.length]!
+export const buddySvg = (state: BuddyState, palette: number, px: number, look?: BuddyLook): string => {
+  const p = look && look.level >= 4 ? GOLD : PALETTES[palette % PALETTES.length]!
   const { ms, frames } = ANIMS[state]
   const n = frames.length
   const period = (ms * n) / 1000
@@ -240,7 +274,7 @@ export const buddySvg = (state: BuddyState, palette: number, px: number): string
     css += `.f${i}{animation-name:k${i}}@keyframes k${i}{` +
       (i === 0 ? '0%{opacity:1}' : `0%{opacity:0}${a}%{opacity:1}`) +
       (i === n - 1 ? '' : `${b}%{opacity:0}`) + (i === n - 1 ? '100%{opacity:1}' : '100%{opacity:0}') + '}'
-    return `<g class="f f${i}">${frameSvg(p, f)}</g>`
+    return `<g class="f f${i}">${frameSvg(p, f, look, i)}</g>`
   }).join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="${px}" height="${px}" shape-rendering="crispEdges" style="background:transparent"><style>${css}</style>${groups}</svg>`
 }

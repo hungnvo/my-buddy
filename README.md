@@ -77,6 +77,27 @@ Under the buddy's label (and in the `/buddy` pane) a `cache 4:12` line counts do
 
 Subagents get their own smaller buddies next to the main one, driven by their own tool calls. A subagent is dropped 5 s after its last turn, or sooner when the main turn ends; one that goes quiet for 10 minutes is dropped too.
 
+## Leveling
+
+Mochi levels up every calendar month (local time), one Mochi across all sessions and projects. Only the main thread earns XP.
+
+| Event | XP | Cap |
+| --- | --- | --- |
+| A turn that used a tool completes | +1 | 40 a day |
+| First such turn of the day | +10 | once a day |
+| `git commit` succeeds (not `--amend`) | +5 | 10 a day |
+| First commit of the day | +10 | once a day |
+| `gh pr create` succeeds | +20 | none |
+| A test command fails, then passes in the same session | +3 | 3 a day |
+| A prompt with thanks (thanks, thank you, thx, cảm ơn, merci, gracias, danke, arigato, 谢谢, ...) | +2 | 5 a day |
+| Coming back after 3+ minutes while the cache is still warm | +2 | 5 a day |
+
+Lv 2 at 200 XP gives a red bow tie, Lv 3 at 900 adds this month's hat, and Lv 4 at 2,500 turns Mochi golden with sparkles (the thresholds are `LEVELS` in `hooks/level.ts`). Mochi's size never changes, and only the main buddy wears the accessories. Commits, PRs and red-to-green runs flash a short "+N" beside Mochi. `/buddy` shows `Lv 2 · 340 / 900 XP` and the golden months so far.
+
+Hats: Jan party hat, Feb heart headband, Mar clover sprout, Apr rain hood, May flower crown, Jun sunglasses, Jul strawberry, Aug sun hat, Sep graduation cap, Oct pumpkin hat, Nov knit beanie, Dec snow cap.
+
+XP resets when the month changes; a month that ended at Lv 4 is kept in the golden list.
+
 ## Development
 
 ```sh

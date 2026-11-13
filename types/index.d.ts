@@ -11,6 +11,13 @@ export type BuddyView = {
   demo: boolean
 }
 
+/** What the main buddy wears: level 2 a bow tie, 3 a hat of the month, 4 a golden body with sparkles */
+export type BuddyLook = {
+  level: number
+  /** 0 (January) to 11 */
+  month: number
+}
+
 export type BuddyLimit = {
   kind: 'five_hour' | 'seven_day'
   percentUsed: number

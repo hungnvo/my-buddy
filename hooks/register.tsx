@@ -1,8 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { BuddyCache, BuddyLimit, BuddyState, BuddyUsage, BuddyView } from '../types'
+import type { BuddyCache, BuddyLimit, BuddyLook, BuddyState, BuddyUsage, BuddyView } from '../types'
 import { EMOJI, LABELS, buddySvg } from './art'
+import type { Src } from './level'
+import {
+  award, commitOutput, goldenLine, isCommit, isPrCreate, isTestCmd, isThanks, levelOf, prOutput, refreshXp, xpLine, freshXp,
+} from './level'
 
 type Api = EngineInterface
 
@@ -36,6 +40,9 @@ const MAIN_PX = 96
 const SUB_PX = 52
 const BAND_MAIN_PX = 64
 const BAND_SUB_PX = 36
+const FLOAT_MS = 4000 // how long a "+N" stays beside the buddy
+const RETURN_IDLE_MS = 180_000 // idle this long, with the cache still warm, counts as coming back
+const MAX_RED = 20
 const DEMO_STEP_MS = 2500
 const DEMO_STATES: BuddyState[] = [
   'idle', 'thinking', 'reading', 'searching', 'editing', 'running', 'browsing',
@@ -263,6 +270,11 @@ let pruned = false // stale stamps are pruned once per process (a hot reload res
 let mainRunning = false // between the main turn.start and turn.complete: the cache line is hidden
 let askedUser = false // the main turn put a question to the person: it ends in waiting, not done
 const subTimers = new Map<string, Timer>()
+let workedTurn = false // the main turn made a non-housekeeping tool call
+let lastMainEnd = 0 // when this process's main turn last completed
+let floater: { n: number; until: number } | null = null
+let floatTimer: Timer | null = null
+const redTests = new Set<string>() // `<session id>|<command>` of test runs that failed and have not passed since
 
 const withDetail = (v: BuddyView, st: BuddyState, detail?: string): BuddyView => {
   const { detail: _old, ...rest } = v
@@ -505,6 +517,55 @@ async function pruneSubs($: Api) {
   })
 }
 
+// Leveling: awards XP, and shows a short "+N" beside the buddy for the sources that ask for one.
+async function earn($: Api, srcs: Src[]) {
+  const { shown } = await award($, srcs)
+  if (shown > 0) {
+    const now = await $.clock.now()
+    floater = { n: (floater && floater.until > now ? floater.n : 0) + shown, until: now + FLOAT_MS }
+    floatTimer?.cancel()
+    floatTimer = $.clock.after(FLOAT_MS, () => {
+      floater = null
+      $.ui.invalidate('ui.render')
+    })
+  }
+  $.ui.invalidate('ui.render')
+}
+
+const floatText = (now: number) => (floater && now < floater.until ? `+${floater.n}` : '')
+
+// What the main buddy wears, and the month's reading it comes from (read again when the month turns).
+async function xpNow($: Api): Promise<{ look: BuddyLook; total: number; golden: string[] } | null> {
+  try {
+    const now = await $.clock.now()
+    const st = await freshXp($, now)
+    if (!st) return null
+    return { look: { level: levelOf(st.total), month: new Date(now).getMonth() }, total: st.total, golden: st.golden }
+  } catch {
+    return null
+  }
+}
+
+// A commit, a pull request or a red-to-green test run on the main thread.
+async function onBash($: Api, e: unknown, result: unknown) {
+  const cmd = (e as { command?: unknown }).command
+  if (typeof cmd !== 'string' || (e as { run_in_background?: unknown }).run_in_background === true) return
+  const r = result as { isError?: unknown; text?: unknown; deny?: unknown } | undefined
+  // A call a hook refused never ran: no commit, PR or test outcome to score.
+  if (!r || typeof r !== 'object' || 'deny' in r) return
+  const failed = !!r?.isError
+  const text = typeof r?.text === 'string' ? r.text : undefined
+  if (!failed && isPrCreate(cmd) && prOutput(text)) await earn($, ['pr'])
+  else if (!failed && isCommit(cmd) && commitOutput(text)) await earn($, ['commit', 'firstCommit'])
+  if (isTestCmd(cmd)) {
+    const key = `${await $.session.id()}|${squash(cmd)}`
+    if (failed) {
+      if (redTests.size >= MAX_RED) redTests.delete(redTests.values().next().value!)
+      redTests.add(key)
+    } else if (redTests.delete(key)) await earn($, ['green'])
+  }
+}
+
 async function setDemo($: Api, on: boolean) {
   isDemo = on
   await update($, view, v => ({ ...v, demo: on }))
@@ -591,6 +652,7 @@ export const register: Register = (on, options) => {
     await safe(() => rescueHelpers($))
     await safe(() => seedUsage($))
     await safe(() => syncCacheTick($))
+    await safe(() => refreshXp($))
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -601,9 +663,26 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     askedUser = false
+    if (!mainRunning) workedTurn = false // a prompt queued mid-turn keeps the running turn's work
     await safe(() => pruneSubs($))
     await safe(() => seedUsage($)) // the percent can go stale after /model
     await safe(() => setMain($, 'thinking'))
+    // XP work does not hold the prompt back; it is serialized through the award queue and invalidates the UI itself.
+    if (!e.command) {
+      const text = e.text
+      void safe(async () => {
+        const srcs: Src[] = []
+        if (isThanks(text)) srcs.push('thanks')
+        const c = await currentCache($)
+        const now = await $.clock.now()
+        if (c && now < c.at + c.ttlMs && now - Math.max(c.at, lastMainEnd) >= RETURN_IDLE_MS) srcs.push('back')
+        if (srcs.length) await earn($, srcs)
+        else {
+          await refreshXp($)
+          $.ui.invalidate('ui.render')
+        }
+      })
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -615,7 +694,10 @@ export const register: Register = (on, options) => {
     }
     const st = stateForTool(e.tool, e)
     const id = e.agentId
-    if (!id) askedUser = false // more work after the ask: the turn no longer ends on it
+    if (!id) {
+      askedUser = false // more work after the ask: the turn no longer ends on it
+      workedTurn = true
+    }
     if (id) subTimers.get(id)?.cancel()
     await safe(() => (id ? setSub($, id, st) : setMain($, st, { detail: detailFor(e.tool, e) })))
     if (id) await safe(() => syncHelpers($))
@@ -624,6 +706,7 @@ export const register: Register = (on, options) => {
       if (id) await safe(() => setSub($, id, 'error'))
       else await safe(() => setMain($, 'error'))
     }
+    if (!id && e.tool === 'Bash') await safe(() => onBash($, e, result))
     return result
   }).catch(($, e, next) => next(e))
 
@@ -652,6 +735,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    let worked = false
     if (e.agentId) {
       const id = e.agentId
       await safe(() => setSub($, id, 'done'))
@@ -661,6 +745,9 @@ export const register: Register = (on, options) => {
     } else {
       const asked = askedUser || (e.reason === 'answer' && typeof e.answer === 'string' && e.answer.trim().endsWith('?'))
       askedUser = false
+      lastMainEnd = await $.clock.now()
+      worked = workedTurn
+      workedTurn = false
       await safe(() => pruneSubs($))
       mainRunning = false
       $.ui.invalidate('ui.render')
@@ -670,6 +757,8 @@ export const register: Register = (on, options) => {
         await safe(() => setMain($, 'done'))
         idleTimer = $.clock.after(DONE_TO_IDLE_MS, () => void toIdle($, true))
       }
+      // After the visible state has changed, so the store never holds up "done".
+      if (worked) await safe(() => earn($, ['turn', 'firstTurn']))
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -751,6 +840,8 @@ export const register: Register = (on, options) => {
     const busy = v.main !== 'idle' || v.demo || v.subs.some(s => s.state !== 'done')
     if (rows.length === 0 && !busy) return next(e)
     const label = labelOf(v)
+    const look = (await xpNow($))?.look
+    const bonus = floatText(await $.clock.now())
     const line = e.props.isWorking || mainRunning ? null : cacheLine(c, await $.clock.now())
     const inline = line !== null && rows.length < 2 // the terminal never grows a row: it joins the label row
     if (e.surface === 'terminal') {
@@ -777,6 +868,7 @@ export const register: Register = (on, options) => {
             <Box flexDirection="column" alignItems="flex-end">
               <Box flexDirection="row">
                 <Text wrap="truncate-end">{`${EMOJI[v.main]} ${label}`}</Text>
+                {bonus && <Text color="green">{` ${bonus}`}</Text>}
                 {line && inline && (
                   <Box flexShrink={0}>
                     <Text dimColor>{' · '}</Text>
@@ -815,12 +907,15 @@ export const register: Register = (on, options) => {
             />
           ))}
           <Box flexDirection="column" alignItems="flex-end">
-            <Text dimColor wrap="truncate-end">{` ${label} `}</Text>
+            <Box flexDirection="row">
+              <Text dimColor wrap="truncate-end">{` ${label} `}</Text>
+              {bonus && <Text color="green">{`${bonus} `}</Text>}
+            </Box>
             {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{`${line.text} `}</Text>}
           </Box>
           <Svg
             key="main"
-            source={buddySvg(v.main, 0, BAND_MAIN_PX)}
+            source={buddySvg(v.main, 0, BAND_MAIN_PX, look)}
             alt={`buddy, ${LABELS[v.main]}`}
             width={BAND_MAIN_PX}
             height={BAND_MAIN_PX}
@@ -833,12 +928,18 @@ export const register: Register = (on, options) => {
   // The pane is on request only (/buddy); docked beside the chat, inline above the prompt when the surface has no dock.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const v = await read($, view)
+    const xp = await xpNow($)
+    const xpText = xp ? xpLine(xp.total) : ''
+    const goldText = xp ? goldenLine(xp.golden) : ''
+    const bonus = floatText(await $.clock.now())
     const line = mainRunning ? null : cacheLine(await currentCache($), await $.clock.now())
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
       return (
         <Box flexDirection="column" alignItems="center">
-          <Text>{`${EMOJI[v.main]} ${labelOf(v)}`}</Text>
+          <Text>{`${EMOJI[v.main]} ${labelOf(v)}${bonus && ` ${bonus}`}`}</Text>
+          {xpText && <Text dimColor>{xpText}</Text>}
+          {goldText && <Text dimColor>{goldText}</Text>}
           {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{line.text}</Text>}
           {v.subs.map(s => (
             <Text key={`sub-${s.id}`} dimColor>{`${EMOJI[s.state]} ${LABELS[s.state]}`}</Text>
@@ -851,12 +952,17 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" alignItems="center">
         <Svg
           key="main"
-          source={buddySvg(v.main, 0, MAIN_PX)}
+          source={buddySvg(v.main, 0, MAIN_PX, xp?.look)}
           alt={`buddy, ${LABELS[v.main]}`}
           width={MAIN_PX}
           height={MAIN_PX}
         />
-        <Text>{labelOf(v)}</Text>
+        <Box flexDirection="row">
+          <Text>{labelOf(v)}</Text>
+          {bonus && <Text color="green">{` ${bonus}`}</Text>}
+        </Box>
+        {xpText && <Text dimColor>{xpText}</Text>}
+        {goldText && <Text dimColor>{goldText}</Text>}
         {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{line.text}</Text>}
         {v.subs.length > 0 && (
           <Box flexDirection="row" flexWrap="wrap" justifyContent="center" columnGap={1}>
