@@ -39,7 +39,7 @@ Then run `/reload-plugins`. On the 5-minute prompt cache, add `--config cacheTtl
 <td align="center"><img src="docs/states/error.svg" width="64" alt="error"><br>error</td>
 <td align="center"><img src="docs/states/done.svg" width="64" alt="done"><br>done</td>
 <td align="center"><img src="docs/states/compacting.svg" width="64" alt="compacting"><br>compacting</td>
-<td></td>
+<td align="center"><img src="docs/states/background.svg" width="64" alt="background"><br>background</td>
 </tr>
 </table>
 
@@ -98,6 +98,7 @@ Hats: 🎉 Jan party hat · 💗 Feb heart headband · 🍀 Mar clover · ☔ Ap
 | error | a tool call fails |
 | done | the turn ends (idle after 5 s) |
 | compacting | the conversation is being compacted |
+| background | the turn is over but a background shell (`run_in_background` or Ctrl+B) or a `Monitor` is still running; subagents still win. Reads `running npm`, or `running 3 tasks` |
 
 The desktop app's housekeeping tools (`mcp__ccd_*`, `TodoWrite`, `Task*`) don't change the state.
 

@@ -3,11 +3,11 @@ import type { BuddyLook, BuddyState } from '../types'
 export const LABELS: Record<BuddyState, string> = {
   idle: 'idle', thinking: 'thinking...', reading: 'reading', searching: 'searching',
   editing: 'editing', running: 'running', browsing: 'browsing', spawning: 'spawning',
-  waiting: 'waiting for you', error: 'oops', done: 'done!', compacting: 'compacting', working: 'working',
+  waiting: 'waiting for you', error: 'oops', done: 'done!', compacting: 'compacting', working: 'working', background: 'running',
 }
 export const EMOJI: Record<BuddyState, string> = {
   idle: '(o.o)', thinking: '(o_o)...', reading: '(o.o)[=]', searching: '(o.o)?o', editing: '(o.o)#',
-  running: '(>.<)*', browsing: '(o.o)8', spawning: '(o.o)~', waiting: '(o.o)?', error: "(T.T)", done: '(^.^)*', compacting: '(o.o)@', working: '(o.o)%',
+  running: '(>.<)*', browsing: '(o.o)8', spawning: '(o.o)~', waiting: '(o.o)?', error: "(T.T)", done: '(^.^)*', compacting: '(o.o)@', working: '(o.o)%', background: '(o.o)[>_]',
 }
 
 const PALETTES = [
@@ -49,6 +49,8 @@ const bubble = (oy: number): Px[] => [
   ...spr(['.kkkkk.', 'kwwwwwk', 'kwwwwwk', 'kwwwwwk', 'kwwwwwk', 'kwwwwwk', '.kkkkk.'], 9, oy),
   ...spr(QMARK, 11, oy + 1), ...dots('k', [9, oy + 7]),
 ]
+// A small laptop at the lower right: light frame, dark screen, base line; 6 wide, inside the 16x16 grid.
+const LAPTOP = ['llllll', 'luuuul', 'luuuul', 'llllll', 'GGGGGG']
 const GEAR_P = [[2, 0], [2, 1], [2, 3], [2, 4], [0, 2], [1, 2], [3, 2], [4, 2]]
 const GEAR_X = [[0, 0], [1, 1], [3, 3], [4, 4], [4, 0], [3, 1], [1, 3], [0, 4]]
 const gear = (pts: number[][], oy: number): Px[] => [
@@ -153,6 +155,16 @@ const ANIMS: Record<BuddyState, Anim> = {
       { dy: 0, props: gear(GEAR_P, 0) },
       { dy: 1, props: gear(GEAR_X, 0) },
     ],
+  },
+  background: {
+    ms: 380, frames: [0, 1, 2, 3].map((i): Frame => ({
+      dy: i % 2, eyes: i === 2 ? 'blink' : 'right',
+      // a green prompt on the top line, a progress dot moving along the second (leaving a dim trail)
+      props: [
+        ...spr(LAPTOP, 10, 11), ...dots('e', [11, 12], [12, 12], [11 + i, 13]),
+        ...dots('E', ...Array.from({ length: i }, (_, j): [number, number] => [11 + j, 13])),
+      ],
+    })),
   },
 }
 

@@ -131,7 +131,7 @@ const labelsOf = async ($: any, on: any, calls: any[]) => {
   return outs
 }
 // `label` is the whole label text node, e.g. 'running git'.
-const hasLabel = (out: string, label: string) => expect(out).toContain(`" ${esc(label)} "`)
+const hasLabel = (out: string, label: string) => { const got = [...out.matchAll(/" ([^"\\]{3,40}) "/g)].map(m => m[1]).join('|'); if (!out.includes(`" ${esc(label)} "`)) throw new Error(`want ${label}; got ${got}`) }
 
 // ---------------------------------------------------------------- main buddy states
 
@@ -2498,4 +2498,788 @@ test('xp: a quiet commit counts unless git had nothing to commit', async ($, on)
   await bash(c, $, 'git commit -q -m y', { result: {}, text: 'nothing to commit, working tree clean' })
   await bash(c, $, 'git commit -m z', { result: {}, text: 'ok' })
   expect(xpSum(st)).toBe(20)
+})
+
+// ---------------------------------------------------------------- background tasks
+
+const SCREEN = '#2b3a67' // the dark screen of the background laptop
+const showsLaptop = (out: string) => expect(out).toMatch(fillRe(SCREEN))
+const noLaptop = (out: string) => expect(out).not.toMatch(fillRe(SCREEN))
+const note = (id: string, status: string) => `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n</task-notification>`
+const fromTask = (text: string) => ({ text, origin: { kind: 'task-notification' } }) as any
+
+// A main turn that starts the given background calls and ends; returns once main is back to idle-or-background.
+const bgBoot = async ($: any, on: any) => {
+  helperMocks(on)
+  on('classic.Stop', () => ({}) as any)
+  on('session.end', (_: any, e: any) => ({ sessionId: e.sessionId }))
+  on('session.receive', (_: any, e: any) => ({ text: e.text }) as any)
+  const res: { result: any; text?: string } = { result: {} }
+  const clock = await boot($, on, res)
+  await clock.advance(800)
+  const start = async (call: any, result: any) => {
+    res.result = result
+    await $.tool.call(call)
+  }
+  const endTurn = async () => {
+    await $.turn.complete(done())
+    await clock.advance(5800)
+  }
+  return { clock, start, endTurn, res }
+}
+const NPM = { tool: 'Bash', command: 'npm run dev -- --token secret', run_in_background: true } as any
+
+test('background: a Bash call with a backgroundTaskId keeps the buddy in background after the turn, by program name only', async ($, on) => {
+  const { start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  const out = await bandOut($)
+  hasLabel(out, `${LABELS.background} npm`)
+  showsLaptop(out)
+  expect(out).not.toMatch(/secret/)
+})
+
+test('background: a user ctrl+B Bash result (backgroundedByUser) counts too', async ($, on) => {
+  const { start, endTurn } = await bgBoot($, on)
+  await start({ tool: 'Bash', command: 'make test' } as any, { backgroundTaskId: 'b1', backgroundedByUser: true })
+  await endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} make`)
+})
+
+test('background: a plain foreground Bash (no backgroundTaskId) goes done then idle', async ($, on) => {
+  const { start, endTurn } = await bgBoot($, on)
+  await start({ tool: 'Bash', command: 'make' } as any, { stdout: '', stderr: '', interrupted: false })
+  await endTurn()
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a Monitor taskId counts, labelled by its description', async ($, on) => {
+  const { start, endTurn } = await bgBoot($, on)
+  await start({ tool: 'Monitor', description: 'tail the deploy log', command: 'tail -f x', timeout_ms: 1000 } as any, { taskId: 'm1', timeoutMs: 1000 })
+  await endTurn()
+  const out = await bandOut($)
+  hasLabel(out, `${LABELS.background} tail the deploy log`)
+  showsLaptop(out)
+})
+
+test('background: several tasks read as a count', async ($, on) => {
+  const { start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await start({ tool: 'Bash', command: 'tail -f log', run_in_background: true } as any, { backgroundTaskId: 'b2' })
+  await start({ tool: 'Monitor', description: 'w' } as any, { taskId: 'm1' })
+  await endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} 3 tasks`)
+})
+
+test("background: a subagent's background shell counts unless it ends with its caller's final response", async ($, on) => {
+  const { clock, start } = await bgBoot($, on)
+  await start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1', backgroundEndsWithFinalResponse: true })
+  await $.turn.complete(done('s1'))
+  await clock.advance(6000)
+  expect(count(await bandOut($))).toBe(0) // no notification can follow: nothing tracked
+  await start(sub('s2', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await $.turn.complete(done('s2'))
+  await clock.advance(6000) // the sub is done and dropped
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a TaskStop with task_id or shell_id ends it: back to idle at once, no done flash', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await start({ tool: 'Bash', command: 'tail -f x', run_in_background: true } as any, { backgroundTaskId: 'b2' })
+  await endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} tail`)
+  await $.tool.call({ tool: 'TaskStop', shell_id: 'b2' } as any)
+  await clock.advance(800)
+  const out = await bandOut($)
+  expect(count(out)).toBe(0)
+  expect(out).not.toContain(LABELS.done)
+})
+
+for (const status of ['completed', 'failed', 'killed']) {
+  test(`background: a shell notification with status ${status} ends it`, async ($, on) => {
+    const { clock, start, endTurn } = await bgBoot($, on)
+    await start(NPM, { backgroundTaskId: 'b1' })
+    await endTurn()
+    hasLabel(await bandOut($), `${LABELS.background} npm`)
+    await $.prompt.submit(fromTask(note('b1', status)))
+    await $.turn.complete(done())
+    await clock.advance(5800)
+    expect(count(await bandOut($))).toBe(0)
+  })
+}
+
+test('background: a notification for another task, or a user prompt naming a task id, ends nothing', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  await $.prompt.submit(fromTask(note('zzz', 'completed')))
+  await $.turn.complete(done())
+  await clock.advance(5800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+  await $.prompt.submit({ text: note('b1', 'completed'), origin: { kind: 'composer' } } as any)
+  await $.turn.complete(done())
+  await clock.advance(5800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a monitor event notification keeps it, a terminal one ends it', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start({ tool: 'Monitor', description: 'watch' } as any, { taskId: 'm1' })
+  await endTurn()
+  await $.prompt.submit(fromTask('<task-notification>\n<task-id>m1</task-id>\n<status>running</status>\n<event>line 1</event>\n</task-notification>'))
+  await $.prompt.submit(fromTask('<task-notification>\n<task-id>m1</task-id>\n<event>line 2</event>\n</task-notification>'))
+  await $.turn.complete(done())
+  await clock.advance(5800)
+  hasLabel(await bandOut($), `${LABELS.background} watch`)
+  await $.prompt.submit(fromTask(note('m1', 'completed')))
+  await $.turn.complete(done())
+  await clock.advance(5800)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a classic.Stop resync drops tasks that are not in flight any more, keeps the listed ones', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await start({ tool: 'Bash', command: 'tail -f x', run_in_background: true } as any, { backgroundTaskId: 'b2' })
+  await endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+  await $.classic.Stop({ background_tasks: [{ id: 'b2', type: 'shell', status: 'running', description: 'x' }] } as any)
+  await clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} tail`)
+  await $.classic.Stop({} as any) // no list: nothing to resync from
+  await clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} tail`)
+  await $.classic.Stop({ background_tasks: [] } as any)
+  await clock.advance(800)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a task that never ended is dropped after 8 hours', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  await clock.advance(7 * 3_600_000)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+  await clock.advance(1.1 * 3_600_000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: helpers come before background, background before idle', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  const bg = await bandOut($)
+  hasLabel(bg, `${LABELS.background} npm`)
+  showsLaptop(bg)
+  await subStart($, 's1')
+  await clock.advance(800)
+  const helpers = await bandOut($)
+  hasLabel(helpers, `${LABELS.working} on 1 helper`)
+  noLaptop(helpers)
+  await $.turn.complete(done('s1')) // the last helper is done, the task still runs: straight to background, no done flash
+  await clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a running main turn shows its tool states, not background', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await clock.advance(800)
+  const out = await bandOut($)
+  hasLabel(out, LABELS.thinking)
+  noLaptop(out)
+})
+
+test('background: the tasks survive a plugin reload (session.start again)', async ($, on) => {
+  const { clock, start, endTurn } = await bgBoot($, on)
+  await start(NPM, { backgroundTaskId: 'b1' })
+  await endTurn()
+  await $.session.start({ ...SS })
+  await clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+for (const reason of ['clear', 'resume']) {
+  test(`background: session.end ${reason} forgets the tasks, other end reasons keep them`, async ($, on) => {
+    const { clock, start, endTurn } = await bgBoot($, on)
+    await start(NPM, { backgroundTaskId: 'b1' })
+    await endTurn()
+    await $.session.end({ reason: 'other', sessionId: 's1', resume: {} } as any)
+    await clock.advance(800)
+    hasLabel(await bandOut($), `${LABELS.background} npm`)
+    await $.session.end({ reason, sessionId: 's1', resume: {} } as any)
+    await clock.advance(800)
+    expect(count(await bandOut($))).toBe(0)
+  })
+}
+
+test('background: the demo includes the background state and the art renders at every level', async ($, on) => {
+  await boot($, on)
+  expect((await run($, 'buddy-demo')).text ?? '').toMatch(/Cycling 14/)
+  for (const level of [0, 2, 3, 4]) {
+    const svg = buddySvg('background', 0, 96, { level, month: 4 })
+    expect(svg).toContain(SCREEN)
+  }
+})
+
+// ---- background tasks, in depth (tester)
+
+// A notification as the engine really delivers it: extra tags, a long result, text around it.
+const REAL = (id: string, status: string, extra = '') =>
+  `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_01CzNgxHF3w1eLjNiUFLSoCf</tool-use-id>\n<output-file>/private/tmp/x/tasks/${id}.output</output-file>\n<status>${status}</status>\n<summary>Agent "Background task buddy state" finished</summary>\n<note>some note</note>\n<result>done <b>ok</b> 1 < 2</result>${extra}\n</task-notification>`
+const endIdle = async (ctx: any) => {
+  await ctx.endTurn()
+}
+const afterNote = async ($: any, clock: any, text: string) => {
+  await $.prompt.submit(fromTask(text))
+  await $.turn.complete(done())
+  await clock.advance(5800)
+}
+
+test('background: the live notification format (extra tags, surrounding text) ends a shell task', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'a980534161d30f121' })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+  await afterNote($, c.clock, `Background work finished.\n${REAL('a980534161d30f121', 'completed')}\nPlease continue.`)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a notification for a subagent id leaves the shell tasks alone', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await afterNote($, c.clock, REAL('a980534161d30f121', 'completed'))
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: one prompt carrying two notifications ends both named tasks', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.start({ tool: 'Bash', command: 'tail -f x', run_in_background: true } as any, { backgroundTaskId: 'b2' })
+  await c.start({ tool: 'Bash', command: 'sleep 99', run_in_background: true } as any, { backgroundTaskId: 'b3' })
+  await endIdle(c)
+  await afterNote($, c.clock, `${REAL('b1', 'completed')}\n${REAL('b2', 'failed')}`)
+  hasLabel(await bandOut($), `${LABELS.background} sleep`)
+})
+
+test('background: status case and whitespace are tolerated; a non-terminal status or missing id ends nothing', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await afterNote($, c.clock, REAL('b1', 'running'))
+  await afterNote($, c.clock, '<task-notification>\n<status>completed</status>\n</task-notification>')
+  await afterNote($, c.clock, '<task-notification>\n<task-id>b1</task-id>\n</task-notification>')
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+  await afterNote($, c.clock, '<task-notification>\n<task-id> b1 </task-id>\n<status> COMPLETED </status>\n</task-notification>')
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a task ending while the main turn runs does not flash idle; the turn end settles to idle', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await c.clock.advance(800)
+  await $.tool.call({ tool: 'Read', file_path: '/x' } as any)
+  await c.clock.advance(800)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  const mid = await bandOut($)
+  expect(mid).toMatch(/" reading x "/)
+  noLaptop(mid)
+  await $.turn.complete(done())
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), LABELS.done)
+  await c.clock.advance(5000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a task starting mid-turn does not interrupt the tool state; after the turn it shows background', async ($, on) => {
+  const c = await bgBoot($, on)
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await c.clock.advance(800)
+  await c.start({ tool: 'Bash', command: 'npm start', run_in_background: true } as any, { backgroundTaskId: 'b1' })
+  await c.clock.advance(800)
+  const mid = await bandOut($)
+  noLaptop(mid)
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a task ending while helpers are active leaves the helpers label; when they finish it goes done then idle', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await subStart($, 's1')
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
+  await $.turn.complete(done('s1'))
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), LABELS.done)
+  await c.clock.advance(5000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a task starting while helpers are active is shown once the helpers finish', async ($, on) => {
+  const c = await bgBoot($, on)
+  await subStart($, 's1')
+  await c.endTurn()
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
+  await $.turn.complete(done('s1'))
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a task started while the done timer is pending is shown when the timer fires, never idle', async ($, on) => {
+  const c = await bgBoot($, on)
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await $.turn.complete(done())
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), LABELS.done)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.clock.advance(4000)
+  await c.clock.advance(2000)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a task ended while the done timer is pending leaves done then idle', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await $.turn.complete(done())
+  await c.clock.advance(800)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(6000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: a task started while idle (subagent or ctrl+B after the turn) shows background at once', async ($, on) => {
+  const c = await bgBoot($, on)
+  await endIdle(c)
+  await c.start({ tool: 'Bash', command: 'npm start' } as any, { backgroundTaskId: 'b1', backgroundedByUser: true })
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a duplicate start id counts once and keeps the newest label', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.start({ tool: 'Bash', command: 'yarn dev', run_in_background: true } as any, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} yarn`)
+})
+
+test('background: TaskStop for an unknown id, a denied TaskStop and an empty id change nothing', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'nope' } as any)
+  await $.tool.call({ tool: 'TaskStop' } as any)
+  await $.tool.call({ tool: 'TaskStop', task_id: '' } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a denied TaskStop stopped nothing', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  Object.keys(c.res).forEach(k => delete (c.res as any)[k])
+  Object.assign(c.res, { deny: 'blocked by policy' })
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: an errored result, or a missing/empty/wrong-typed id, starts no task', async ($, on) => {
+  const c = await bgBoot($, on)
+  const raw = (call: any, r: any) => {
+    Object.keys(c.res).forEach(k => delete (c.res as any)[k])
+    Object.assign(c.res, r)
+    return $.tool.call(call)
+  }
+  await raw(NPM, { isError: true, result: { backgroundTaskId: 'b1' } })
+  await raw({ tool: 'Monitor', description: 'w' } as any, { isError: true, result: { taskId: 'm1' } })
+  await raw(NPM, { result: {} })
+  await raw(NPM, { result: 'str' })
+  await raw(NPM, { result: { backgroundTaskId: '' } })
+  await raw(NPM, { result: { backgroundTaskId: 42 } })
+  await raw({ tool: 'Monitor', description: 'w' } as any, { result: { backgroundTaskId: 'x' } }) // wrong field for a monitor
+  await raw({ tool: 'Bash', command: 'x' } as any, { result: { taskId: 'x' } }) // wrong field for a shell
+  await raw({ tool: 'Read', file_path: '/x' } as any, { result: { backgroundTaskId: 'r1', taskId: 'r2' } })
+  await endIdle(c)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: monitor label is trimmed to 24 chars and squashed; a shell label never carries arguments', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start({ tool: 'Monitor', description: 'watch   the\ndeploy log for errors until done' } as any, { taskId: 'm1' })
+  await endIdle(c)
+  const out = await bandOut($)
+  expect(out).toMatch(/running watch the deploy log/)
+  expect(out).not.toMatch(/until done/)
+})
+
+test('background: shell label falls back for a missing or blank command; monitor falls back to "monitor"', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start({ tool: 'Bash', run_in_background: true } as any, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} shell`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.start({ tool: 'Monitor', description: '   ' } as any, { taskId: 'm1' })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} monitor`)
+})
+
+test('background: many tasks are capped at 20 (oldest dropped) and read as a count', async ($, on) => {
+  const c = await bgBoot($, on)
+  for (let i = 0; i < 25; i++) await c.start({ tool: 'Bash', command: `job${i}`, run_in_background: true } as any, { backgroundTaskId: `t${i}` })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} 20 tasks`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 't0' } as any) // dropped long ago: unknown now
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} 20 tasks`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 't24' } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} 19 tasks`)
+})
+
+test('background: the 8 hour rescue drops only the old task and the count follows', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await c.clock.advance(7 * 3_600_000)
+  await c.start({ tool: 'Bash', command: 'tail -f x', run_in_background: true } as any, { backgroundTaskId: 'b2' })
+  await endIdle(c)
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+  await c.clock.advance(1.1 * 3_600_000)
+  hasLabel(await bandOut($), `${LABELS.background} tail`)
+})
+
+test('background: the 60s tick is not armed while idle, is armed in background, and is cancelled once tasks end', async ($, on) => {
+  const c = await bgBoot($, on)
+  const pending = () => (c.clock as any).pending?.() ?? null
+  await endIdle(c)
+  const base = pending()
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  const armed = pending()
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  const after = pending()
+  if (base !== null) {
+    expect(armed).toBeGreaterThan(base)
+    expect(after).toBe(base)
+  }
+  // behavioural check regardless: long idle stretch stays idle with no tasks
+  await c.clock.advance(3_600_000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: while demo runs, tasks do not change the demo; after it ends the buddy restores to background', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await run($, 'buddy-demo')
+  for (let i = 0; i < 13; i++) {
+    await c.clock.advance(2500)
+    const out = await bandOut($)
+    expect(out).not.toMatch(/running npm/)
+  }
+  await c.clock.advance(3000)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a task started during the demo is shown after it ends', async ($, on) => {
+  const c = await bgBoot($, on)
+  await endIdle(c)
+  await run($, 'buddy-demo')
+  await c.clock.advance(2500 * 3)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.clock.advance(2500 * 11)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a task stopped during the demo is not resurrected after it ends', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await run($, 'buddy-demo')
+  await c.clock.advance(2500 * 3)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(2500 * 11)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: the label shows on the terminal band and the pane', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  const term = await bandOut($, 'terminal')
+  expect(term).toContain(`${LABELS.background} npm`)
+  const ui = await mountPane($)
+  const pane = await drawn(ui)
+  expect(pane).toContain(`${LABELS.background} npm`)
+  expect(pane).toMatch(fillRe(SCREEN))
+  await ui.unmount()
+  const ui2 = await mountPane($, 'terminal')
+  expect(await drawn(ui2)).toContain(`${LABELS.background} npm`)
+  await ui2.unmount()
+})
+
+test('background: no XP for starting, running or ending a background task', async ($, on) => {
+  const st = new Map<string, unknown>()
+  on('classic.Stop', () => ({}) as any)
+  const ctx = await levelBoot($, on, st)
+  await bash(ctx, $, 'npm run dev', { result: { backgroundTaskId: 'b1' } }, { run_in_background: true })
+  await bash(ctx, $, 'git commit -m x', { result: { backgroundTaskId: 'b2' }, text: '[main abc1234] msg' }, { run_in_background: true })
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await $.classic.Stop({ background_tasks: [] } as any)
+  await $.prompt.submit(fromTask(REAL('b2', 'completed')))
+  await settle()
+  await $.turn.complete(done())
+  expect(xpSum(st)).toBe(0)
+})
+
+test('background: classic.Stop with a task listed by id keeps a monitor; entries without an id are ignored safely', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start({ tool: 'Monitor', description: 'watch' } as any, { taskId: 'm1' })
+  await endIdle(c)
+  await $.classic.Stop({ background_tasks: [null, {}, { id: 'm1' }] } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} watch`)
+})
+
+test('background: a reload (session.start) resets the state flag but the stored tasks restore background', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await endIdle(c)
+  await $.session.start({ ...SS })
+  await c.clock.advance(800)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+// ---- background tasks: review fixes
+
+test('background: a notification delivered to a subagent through session.receive ends the task', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+  const e = { text: note('b1', 'completed'), origin: { kind: 'task-notification' }, agentId: 's1' } as any
+  await $.session.receive(e)
+  await c.clock.advance(800)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: session.receive ignores other origins and unnamed tasks', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  await $.session.receive({ text: note('b1', 'completed'), origin: { kind: 'peer' }, agentId: 's1' } as any)
+  await $.session.receive({ text: note('zzz', 'completed'), origin: { kind: 'task-notification' }, agentId: 's1' } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a session.receive notification mid-turn does not flash idle', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+  await c.clock.advance(800)
+  await $.tool.call({ tool: 'Read', file_path: '/x' } as any)
+  await c.clock.advance(800)
+  await $.session.receive({ text: note('b1', 'completed'), origin: { kind: 'task-notification' }, agentId: 's1' } as any)
+  const mid = await bandOut($)
+  expect(mid).toMatch(/" reading x "/)
+  noLaptop(mid)
+})
+
+test('background: the band never shows idle between background and thinking when a task ends', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  await $.prompt.submit(fromTask(note('b1', 'completed')))
+  for (let i = 0; i < 8; i++) {
+    const out = await bandOut($)
+    expect(count(out)).toBeGreaterThan(0) // never the hidden (idle) band
+    await c.clock.advance(100)
+  }
+  hasLabel(await bandOut($), LABELS.thinking)
+})
+
+test("background: a <status> echoed inside a monitor event's output does not end the monitor", async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start({ tool: 'Monitor', description: 'watch' } as any, { taskId: 'm1' })
+  await c.endTurn()
+  await $.prompt.submit(fromTask(
+    '<task-notification>\n<task-id>m1</task-id>\n<tool-use-id>t</tool-use-id>\n<event>build log: <status>completed</status></event>\n</task-notification>',
+  ))
+  await $.prompt.submit(fromTask(
+    '<task-notification>\n<task-id>m1</task-id>\n<summary>s</summary>\n<status>failed</status>\n</task-notification>',
+  ))
+  await $.turn.complete(done())
+  await c.clock.advance(5800)
+  hasLabel(await bandOut($), `${LABELS.background} watch`)
+})
+
+test("background: a monitor is dropped at its own timeout plus slack; a persistent one keeps the 8 hour net", async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start({ tool: 'Monitor', description: 'timed' } as any, { taskId: 'm1', timeoutMs: 60_000 })
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} timed`)
+  await c.clock.advance(60_000 + 120_000)
+  await c.clock.advance(60_000) // the next rescue tick
+  expect(count(await bandOut($))).toBe(0)
+  await c.start({ tool: 'Monitor', description: 'forever' } as any, { taskId: 'm2', timeoutMs: 0, persistent: true })
+  await c.endTurn()
+  await c.clock.advance(3_600_000)
+  hasLabel(await bandOut($), `${LABELS.background} forever`)
+})
+
+test('background: a task stored without a deadline gets the 8 hour net', async ($, on) => {
+  let cur: any = { value: { shape: 'tasks-2', value: [{ id: 'old', kind: 'shell', label: 'oldjob', startedAt: 0 }] }, version: 1 }
+  on('state.get', { plugin: 'my-buddy', key: 'tasks' } as any, () => ({ value: cur }) as any)
+  on('state.set', { plugin: 'my-buddy', key: 'tasks' } as any, async (_: any, e: any, next: any) => {
+    const r = await next(e)
+    cur = { value: e.value, version: (r as any)?.version ?? cur.version + 1 }
+    return r
+  })
+  const c = await bgBoot($, on)
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} oldjob`)
+  await c.clock.advance(8.1 * 3_600_000)
+  expect(count(await bandOut($))).toBe(0)
+})
+
+// ---- background tasks: gap tests for the review-fix round
+
+const TASK_NOTE = (inner: string) => `<task-notification>${inner}</task-notification>`
+for (const [name, text, ended] of [
+  ['whitespace and newlines between header tags', TASK_NOTE('\n  <task-id>\n b1 \n</task-id>\n\n\t<status>\n completed\n</status>\n<summary>x</summary>'), true],
+  ['status before task-id', TASK_NOTE('<status>failed</status><task-id>b1</task-id>'), true],
+  ['all header tags reordered', TASK_NOTE('<output-file>/x</output-file><status>killed</status><tool-use-id>t</tool-use-id><task-id>b1</task-id><summary>s</summary>'), true],
+  ['no status at all', TASK_NOTE('<task-id>b1</task-id><summary>done</summary>'), false],
+  ['status only after a non-header tag', TASK_NOTE('<task-id>b1</task-id><summary>s</summary><status>completed</status>'), false],
+  ['text before the header', 'preamble text <task-id>zz</task-id> ' + TASK_NOTE('<task-id>b1</task-id><status>completed</status>'), true],
+  ['repeated task-id: the first wins', TASK_NOTE('<task-id>other</task-id><task-id>b1</task-id><status>completed</status>'), false],
+  ['repeated status: the first wins (non-terminal first)', TASK_NOTE('<task-id>b1</task-id><status>running</status><status>completed</status>'), false],
+  ['header with an unknown tag first', TASK_NOTE('<foo>x</foo><task-id>b1</task-id><status>completed</status>'), false],
+] as const) {
+  test(`background: header parsing, ${name}`, async ($, on) => {
+    const c = await bgBoot($, on)
+    await c.start(NPM, { backgroundTaskId: 'b1' })
+    await c.endTurn()
+    await $.session.receive({ text, origin: { kind: 'task-notification' }, agentId: 's1' } as any)
+    await c.clock.advance(800)
+    if (ended) expect(count(await bandOut($))).toBe(0)
+    else hasLabel(await bandOut($), `${LABELS.background} npm`)
+  })
+}
+
+test('background: session.receive of a non-task origin with tags in its text ends nothing (any thread)', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  for (const kind of ['composer', 'peer', 'channel', 'agent']) {
+    await $.session.receive({ text: note('b1', 'completed'), origin: { kind } } as any)
+    await $.session.receive({ text: note('b1', 'completed'), origin: { kind }, agentId: 's1' } as any)
+  }
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: session.receive passes the event to next unchanged for every origin', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  const t1 = note('b1', 'completed')
+  const r1 = await $.session.receive({ text: t1, origin: { kind: 'task-notification' }, agentId: 's1' } as any)
+  const r2 = await $.session.receive({ text: 'plain', origin: { kind: 'composer' } } as any)
+  expect((r1 as any)?.text).toBe(t1)
+  expect((r2 as any)?.text).toBe('plain')
+})
+
+test('background: a main-thread session.receive (no agentId, no prompt.submit after) drops the task; the band settles at the next rescue tick', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await c.endTurn()
+  await $.session.receive({ text: note('b1', 'completed'), origin: { kind: 'task-notification' } } as any)
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), `${LABELS.background} npm`) // state left alone: the submit is expected to follow
+  await c.clock.advance(60_000)
+  expect(count(await bandOut($))).toBe(0) // the 60s rescue tick resyncs to idle
+})
+
+test('background: a notification prompt.submit while main shows helpers (not background) ends the task, keeps the helpers label and then thinking', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1' })
+  await subStart($, 's1')
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
+  await $.prompt.submit(fromTask(note('b1', 'completed')))
+  await c.clock.advance(800)
+  hasLabel(await bandOut($), LABELS.thinking)
+  await $.turn.complete(done())
+  await c.clock.advance(800)
+  // helper still active, task gone: back to helpers, never background
+  await c.clock.advance(5800)
+  hasLabel(await bandOut($), `${LABELS.working} on 1 helper`)
+})
+
+for (const [name, result, wantDroppedAfterMs] of [
+  ['timeoutMs 0', { taskId: 'm1', timeoutMs: 0 }, 8 * 3_600_000],
+  ['negative timeoutMs', { taskId: 'm1', timeoutMs: -5000 }, 8 * 3_600_000],
+  ['missing timeoutMs', { taskId: 'm1' }, 8 * 3_600_000],
+  ['string timeoutMs', { taskId: 'm1', timeoutMs: '60000' }, 8 * 3_600_000],
+  ['persistent with a timeoutMs', { taskId: 'm1', timeoutMs: 60_000, persistent: true }, 8 * 3_600_000],
+  ['timeoutMs 60s', { taskId: 'm1', timeoutMs: 60_000 }, 180_000],
+] as const) {
+  test(`background: monitor deadline, ${name}`, async ($, on) => {
+    const c = await bgBoot($, on)
+    await c.start({ tool: 'Monitor', description: 'mon' } as any, result)
+    await c.endTurn()
+    hasLabel(await bandOut($), `${LABELS.background} mon`)
+    await c.clock.advance(wantDroppedAfterMs - 120_000)
+    hasLabel(await bandOut($), `${LABELS.background} mon`)
+    await c.clock.advance(180_000) // past the deadline, plus a rescue tick
+    expect(count(await bandOut($))).toBe(0)
+  })
+}
+
+test('background: a shell with a timeoutMs in its result still gets the 8 hour net', async ($, on) => {
+  const c = await bgBoot($, on)
+  await c.start(NPM, { backgroundTaskId: 'b1', timeoutMs: 1000 })
+  await c.endTurn()
+  await c.clock.advance(3_600_000)
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: a stored tasks-1 value after the shape bump (documents what the atom does)', async ($, on) => {
+  let cur: any = { value: { shape: 'tasks-1', value: [{ id: 'old', kind: 'shell', label: 'oldjob', startedAt: 0 }] }, version: 1 }
+  on('state.get', { plugin: 'my-buddy', key: 'tasks' } as any, () => ({ value: cur }) as any)
+  on('state.set', { plugin: 'my-buddy', key: 'tasks' } as any, async (_: any, e: any, next: any) => {
+    const r = await next(e)
+    cur = { value: e.value, version: (r as any)?.version ?? cur.version + 1 }
+    return r
+  })
+  const c = await bgBoot($, on)
+  await c.endTurn()
+  // Expectation: a value of an older shape is not trusted, so it is reset (no ghost task).
+  expect(count(await bandOut($))).toBe(0)
 })

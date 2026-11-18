@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { BuddyCache, BuddyLimit, BuddyLook, BuddyState, BuddyUsage, BuddyView } from '../types'
+import type { BuddyCache, BuddyLimit, BuddyLook, BuddyState, BuddyTask, BuddyUsage, BuddyView } from '../types'
 import { EMOJI, LABELS, buddySvg } from './art'
 import type { Src } from './level'
 import {
@@ -13,6 +13,9 @@ type Api = EngineInterface
 const view = atom({ plugin: 'my-buddy', key: 'view' } as const, { main: 'idle', subs: [], demo: false } as BuddyView, {
   shape: 'view-2',
 })
+
+// Background shells and monitors still running; kept in an atom so a plugin reload does not forget them.
+const tasks = atom({ plugin: 'my-buddy', key: 'tasks' } as const, [] as BuddyTask[], { shape: 'tasks-2' })
 
 const usage = atom({ plugin: 'my-buddy', key: 'usage' } as const, null as BuddyUsage | null, { shape: 'usage-2' })
 
@@ -29,6 +32,9 @@ const MIN_DWELL_MS = 700
 const DONE_TO_IDLE_MS = 5000
 const STALE_SUB_MS = 600_000 // a rescue for lost subagent turn.complete events, so longer than any one tool call
 const HELPERS_TICK_MS = 60_000
+const STALE_TASK_MS = 8 * 3_600_000 // a rescue for a task whose end was never seen
+const TASK_SLACK_MS = 120_000 // a monitor's timeout, plus time for its end to arrive
+const MAX_TASKS = 20
 const CACHE_TICK_MS = 5000
 const CACHE_WARN_MS = 60_000
 const CACHE_COARSE_TICK_MS = 60_000
@@ -46,7 +52,7 @@ const MAX_RED = 20
 const DEMO_STEP_MS = 2500
 const DEMO_STATES: BuddyState[] = [
   'idle', 'thinking', 'reading', 'searching', 'editing', 'running', 'browsing',
-  'spawning', 'waiting', 'error', 'done', 'compacting', 'working',
+  'spawning', 'waiting', 'error', 'done', 'compacting', 'working', 'background',
 ]
 
 const stateForTool = (tool: string, e?: unknown): BuddyState => {
@@ -260,6 +266,7 @@ let pendTimer: Timer | null = null
 let idleTimer: Timer | null = null
 let isDemo = false
 let inHelpers = false // main shows `working on N helpers` while background subs run; a reload resets it with the view
+let inBg = false // main shows `running <task>` while background shells or monitors run; reset the same way
 let helpersTick: Timer | null = null
 let cacheTick: Timer | null = null
 let cacheGen = 0 // bumped on every stop, so a callback of a cancelled tick cannot re-arm it
@@ -291,10 +298,11 @@ async function apply($: Api, st: BuddyState, detail?: string) {
   await update($, view, v => withDetail(v, st, detail))
 }
 
-async function setMain($: Api, st: BuddyState, o: { demo?: boolean; fromTimer?: boolean; force?: boolean; detail?: string; helpers?: boolean } = {}) {
+async function setMain($: Api, st: BuddyState, o: { demo?: boolean; fromTimer?: boolean; force?: boolean; detail?: string; helpers?: boolean; bg?: boolean } = {}) {
   if (isDemo && !o.demo) return
   inHelpers = o.helpers === true
-  if (inHelpers) helpersTick ??= $.clock.every(HELPERS_TICK_MS, () => void rescueHelpers($))
+  inBg = o.bg === true
+  if (inHelpers || inBg) helpersTick ??= $.clock.every(HELPERS_TICK_MS, () => void rescueHelpers($))
   else {
     helpersTick?.cancel()
     helpersTick = null
@@ -341,6 +349,7 @@ async function setSub($: Api, id: string, st: BuddyState) {
 async function resetLeftovers($: Api) {
   isDemo = false
   inHelpers = false
+  inBg = false
   helpersTick?.cancel()
   helpersTick = null
   stopCacheTick()
@@ -517,6 +526,72 @@ async function pruneSubs($: Api) {
   })
 }
 
+// Drop tasks past their deadline (a monitor's own timeout, else 8 hours): their end was lost.
+// A task stored before deadlines existed has none and gets the 8 hour net.
+async function pruneTasks($: Api) {
+  const now = await $.clock.now()
+  await update($, tasks, t => {
+    const live = t.filter(x => now <= (x.deadline ?? x.startedAt + STALE_TASK_MS))
+    return live.length === t.length ? t : live
+  })
+}
+
+async function addTask($: Api, task: BuddyTask) {
+  await update($, tasks, t => [...t.filter(x => x.id !== task.id), task].slice(-MAX_TASKS))
+  await safe(() => syncHelpers($))
+}
+
+// Removes the tasks the test names; a no-op write is skipped. `sync: false` leaves the state alone (the caller sets it).
+async function dropTasks($: Api, gone: (t: BuddyTask) => boolean, sync = true) {
+  await update($, tasks, t => (t.some(gone) ? t.filter(x => !gone(x)) : t))
+  if (sync) await safe(() => syncHelpers($))
+}
+
+const TERMINAL = new Set(['completed', 'failed', 'killed', 'stopped', 'cancelled', 'canceled', 'timeout', 'timed_out'])
+
+// The envelope's own header tags, read from its start up to the first other tag (`<summary>`, `<event>`, `<result>`...),
+// so a `<status>` echoed inside an event's output never counts.
+const HEADER_TAG = /^\s*<(task-id|tool-use-id|output-file|status)>\s*([^<]*?)\s*<\/\1>/
+const headerOf = (chunk: string): Record<string, string> => {
+  const h: Record<string, string> = {}
+  for (let rest = chunk, m = HEADER_TAG.exec(rest); m; m = HEADER_TAG.exec(rest)) {
+    h[m[1]!] ??= m[2]!
+    rest = rest.slice(m[0].length)
+  }
+  return h
+}
+
+// The ended tasks a notification names: the `<task-id>` and `<status>` of each `<task-notification>` envelope.
+const endedIn = (text: string): string[] =>
+  text.split('<task-notification>').flatMap(chunk => {
+    const h = headerOf(chunk)
+    const id = h['task-id']
+    const status = h.status?.toLowerCase()
+    return id && status && TERMINAL.has(status) ? [id] : []
+  })
+
+// What a started task is called: a shell by its program name only, a monitor by its short description.
+const taskLabel = (kind: BuddyTask['kind'], e: unknown): string => {
+  const a = (e && typeof e === 'object' ? e : {}) as Record<string, unknown>
+  if (kind === 'shell') return typeof a.command === 'string' ? bashDetail(a.command.trim()) || 'shell' : 'shell'
+  return typeof a.description === 'string' ? trim(squash(a.description), 24) || 'monitor' : 'monitor'
+}
+
+// A Bash call that went to the background (run_in_background or ctrl+B) or a Monitor: a task outliving the call.
+async function onTaskStart($: Api, e: { tool: string }, result: unknown) {
+  const r = (result as { result?: unknown; isError?: unknown } | undefined)
+  if (!r || typeof r !== 'object' || r.isError || !r.result || typeof r.result !== 'object') return
+  const out = r.result as { backgroundTaskId?: unknown; taskId?: unknown; backgroundEndsWithFinalResponse?: unknown; timeoutMs?: unknown; persistent?: unknown }
+  const kind = e.tool === 'Monitor' ? 'monitor' : e.tool === 'Bash' ? 'shell' : null
+  const id = kind === 'monitor' ? out.taskId : kind === 'shell' ? out.backgroundTaskId : undefined
+  if (!kind || typeof id !== 'string' || !id) return
+  if (kind === 'shell' && out.backgroundEndsWithFinalResponse) return // ended with its caller's last reply: no notification can follow
+  const startedAt = await $.clock.now()
+  const own = kind === 'monitor' && out.persistent !== true && typeof out.timeoutMs === 'number' && out.timeoutMs > 0
+  const deadline = startedAt + (own ? (out.timeoutMs as number) + TASK_SLACK_MS : STALE_TASK_MS)
+  await addTask($, { id, kind, label: taskLabel(kind, e), startedAt, deadline })
+}
+
 // Leveling: awards XP, and shows a short "+N" beside the buddy for the sources that ask for one.
 async function earn($: Api, srcs: Src[]) {
   const { shown } = await award($, srcs)
@@ -574,30 +649,42 @@ async function setDemo($: Api, on: boolean) {
 const activeSubs = (v: BuddyView) => v.subs.filter(s => s.state !== 'done').length
 const helpersDetail = (n: number) => `on ${n} helper${n === 1 ? '' : 's'}`
 
-// Main goes idle, unless background subs are still working: then it shows them instead.
+// What main says while background shells or monitors run: one task by its label, several by count.
+const bgDetail = (t: BuddyTask[]) => (t.length === 1 ? t[0]!.label : `${t.length} tasks`)
+
+// Main goes idle, unless background subs are still working (they come first) or background tasks are still running.
 async function toIdle($: Api, fromTimer = false) {
   await safe(() => pruneSubs($))
+  await safe(() => pruneTasks($))
   const n = isDemo ? 0 : activeSubs(await read($, view))
   if (n > 0) return setMain($, 'working', { fromTimer, helpers: true, detail: helpersDetail(n) })
+  const t = isDemo ? [] : await read($, tasks)
+  if (t.length > 0) return setMain($, 'background', { fromTimer, bg: true, detail: bgDetail(t) })
   return setMain($, 'idle', { fromTimer })
 }
 
-// After the active subs change: enter the helpers state, keep its count, or end it.
+// After the active subs or background tasks change: enter the helpers or background state, keep its count, or end it.
 async function syncHelpers($: Api) {
   if (isDemo) return
   const v = await read($, view)
   const n = activeSubs(v)
   if (n > 0) {
-    if (inHelpers || (pending ?? shown) === 'idle') await setMain($, 'working', { helpers: true, detail: helpersDetail(n) })
+    if (inHelpers || inBg || (pending ?? shown) === 'idle') await setMain($, 'working', { helpers: true, detail: helpersDetail(n) })
+    return
+  }
+  const t = await read($, tasks)
+  if (t.length > 0) {
+    if (inHelpers || inBg || (pending ?? shown) === 'idle') await setMain($, 'background', { bg: true, detail: bgDetail(t) })
   } else if (inHelpers) {
     await setMain($, 'done')
     idleTimer = $.clock.after(DONE_TO_IDLE_MS, () => void toIdle($, true))
-  }
+  } else if (inBg) await setMain($, 'idle')
 }
 
-// A sub whose turn.complete was lost never ends the helpers state by itself.
+// A sub whose turn.complete was lost never ends the helpers state by itself; nor a task whose end was never seen.
 async function rescueHelpers($: Api) {
   await safe(() => pruneSubs($))
+  await safe(() => pruneTasks($))
   await safe(() => syncHelpers($))
 }
 
@@ -667,6 +754,12 @@ export const register: Register = (on, options) => {
     await safe(() => pruneSubs($))
     await safe(() => seedUsage($)) // the percent can go stale after /model
     await safe(() => setMain($, 'thinking'))
+    // A background task's notification names the ended tasks; a monitor's per-event ones name none.
+    // After thinking is set, so the drop finds us out of the background state and does not flash idle.
+    if (e.origin?.kind === 'task-notification') {
+      const ended = new Set(endedIn(e.text))
+      if (ended.size) await safe(() => dropTasks($, t => ended.has(t.id)))
+    }
     // XP work does not hold the prompt back; it is serialized through the award queue and invalidates the UI itself.
     if (!e.command) {
       const text = e.text
@@ -686,7 +779,25 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // A background subagent's task notification is delivered to the subagent, not through prompt.submit.
+  on('session.receive', async ($, e, next) => {
+    if (e.origin.kind === 'task-notification') {
+      const ended = new Set(endedIn(e.text))
+      // Mid-turn, or on main's own delivery (its prompt.submit follows and sets thinking), the state is left alone.
+      if (ended.size) await safe(() => dropTasks($, t => ended.has(t.id), !mainRunning && !!e.agentId))
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', async ($, e, next) => {
+    if (e.tool === 'TaskStop') {
+      // Stopping a task ends it, whichever thread asked; a refused call stopped nothing.
+      const r = await next(e)
+      const a = e as { task_id?: unknown; shell_id?: unknown }
+      const id = typeof a.task_id === 'string' && a.task_id ? a.task_id : typeof a.shell_id === 'string' ? a.shell_id : ''
+      if (id && !(r && 'deny' in r && r.deny)) await safe(() => dropTasks($, t => t.id === id))
+      return r
+    }
     if (isHousekeeping(e.tool)) {
       const ask = (e as { ask?: unknown }).ask
       if (!e.agentId && e.tool === 'mcp__ccd_turn__wrap_up') askedUser = typeof ask === 'string' && !!ask.trim()
@@ -707,6 +818,7 @@ export const register: Register = (on, options) => {
       else await safe(() => setMain($, 'error'))
     }
     if (!id && e.tool === 'Bash') await safe(() => onBash($, e, result))
+    if (e.tool === 'Bash' || e.tool === 'Monitor') await safe(() => onTaskStart($, e, result))
     return result
   }).catch(($, e, next) => next(e))
 
@@ -785,6 +897,7 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') {
+      await safe(() => dropTasks($, () => true)) // another conversation: its tasks are not ours to show
       // usage() still reads the ending conversation here (an in-session /resume gets no session.start after it): drop its context, keep the limits; the next measure refills it.
       // The cache line needs no forgetting: stamps are keyed by session id. But no session.start follows, so once the id
       // has switched, re-sync the tick: the new conversation may hold a warm stamp (a resume) the old tick never drew.
@@ -795,6 +908,16 @@ export const register: Register = (on, options) => {
       limitsEpoch++
       await safe(() => $.store.delete(LIMITS_KEY))
       isBearer = null // re-read lazily: the credential may not be gone yet, and a new login may follow
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // The Stop input lists the work still in flight: a resync, for when a task's end was missed.
+  on('classic.Stop', async ($, e, next) => {
+    const live = (e as { background_tasks?: { id?: unknown }[] }).background_tasks
+    if (Array.isArray(live)) {
+      const ids = new Set(live.map(x => x?.id))
+      await safe(() => dropTasks($, t => !ids.has(t.id)))
     }
     return next(e)
   }).catch(($, e, next) => next(e))

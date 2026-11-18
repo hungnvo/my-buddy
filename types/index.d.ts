@@ -1,6 +1,18 @@
 export type BuddyState =
   | 'idle' | 'thinking' | 'reading' | 'searching' | 'editing' | 'running'
-  | 'browsing' | 'spawning' | 'waiting' | 'error' | 'done' | 'compacting' | 'working'
+  | 'browsing' | 'spawning' | 'waiting' | 'error' | 'done' | 'compacting' | 'working' | 'background'
+
+/** A background shell or monitor that outlives the tool call that started it */
+export type BuddyTask = {
+  id: string
+  kind: 'shell' | 'monitor'
+  /** program name for a shell (never its arguments), a short description for a monitor */
+  label: string
+  /** `$.clock.now()` milliseconds */
+  startedAt: number
+  /** `$.clock.now()` milliseconds after which its end is presumed lost; absent in a value stored before `tasks-2` (8 hours) */
+  deadline?: number
+}
 
 export type BuddyView = {
   main: BuddyState
@@ -41,6 +53,6 @@ export type BuddyCache = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null> }
+    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null>; tasks: Shaped<BuddyTask[]> }
   }
 }
