@@ -15,7 +15,7 @@ Then run `/reload-plugins`. On the 5-minute prompt cache, add `--config cacheTtl
 
 ## Commands
 
-- `/buddy` opens the buddy pane.
+- `/buddy` shows your level and XP in the chat.
 - `/buddy keepwarm [on|off]` turns keep-warm on or off for this session (no argument toggles it) and says how big the context is.
 - `/buddy-demo` plays every animation.
 
@@ -86,7 +86,7 @@ Mochi earns XP from real work and levels up each calendar month. XP is shared ac
 | say thanks | +2 | 5 |
 | come back while the cache is still warm | +2 | 5 |
 
-Commits, PRs and fixed tests flash a green `+N` next to Mochi. `/buddy` shows your progress (`Lv 2 · 340 / 900 XP`) and every month you reached Lv 4.
+Commits, PRs and fixed tests flash a green `+N` next to Mochi. `/buddy` replies with your level (`Lv 2 · 340 / 900 XP`), today's XP with the next reward (`Today +36 XP · next: Nov knit beanie in 560 XP`) and every month you reached Lv 4.
 
 Hats: 🎉 Jan party hat · 💗 Feb heart headband · 🍀 Mar clover · ☔ Apr rain hood · 🌸 May flower crown · 🕶️ Jun sunglasses · 🍓 Jul strawberry · 👒 Aug sun hat · 🎓 Sep graduation cap · 🎃 Oct pumpkin · 🧶 Nov knit beanie · ❄️ Dec snow cap
 

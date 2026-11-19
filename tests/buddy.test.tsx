@@ -1,16 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { LABELS, buddySvg } from '../hooks/art'
-import { award, freshXp, xpLine } from '../hooks/level'
+import { award, freshXp, xpLine, xpSummary } from '../hooks/level'
 
 // ---------------------------------------------------------------- helpers
-
-const PANE = {
-  plugin: 'my-buddy',
-  component: 'Pane',
-  requestId: 'my-buddy',
-  props: { title: 'Buddy', isFocused: false, bodyColumns: 40, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
-} as const
 
 // The session id the process is in; a test changes it to stand for a /clear or a resume.
 const sid = { current: 's1' }
@@ -54,7 +47,6 @@ const engine = (on: any) =>
 
 const drawn = async (ui: any) => JSON.stringify(await ui.drawn())
 const count = (t: string) => (t.match(/"type":"Svg"/g) ?? []).length
-const mountPane = ($: any, surface = 'desktop', requestId = 'my-buddy') => $.ui.mount({ ...PANE, requestId, surface } as any)
 const run = ($: any, command: string) =>
   $.command.run({ command, args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
 
@@ -83,6 +75,17 @@ const bandOutWith = async ($: any, props: Record<string, unknown>, surface = 'de
   const out = await drawn(ui)
   await ui.unmount()
   return out
+}
+
+// The text of a bare /buddy, and the level the band's buddy wears (a meter row keeps the band up while idle).
+const xpText = async ($: any) => ((await run($, 'buddy')).text ?? '') as string
+const bandLevel = async ($: any, surface = 'desktop') => {
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const out = await bandOut($, surface)
+  for (let l = 4; l >= 1; l--)
+    for (const st of Object.keys(LABELS))
+      for (let m = 0; m < 12; m++) if (out.includes(JSON.stringify(buddySvg(st as any, 0, 64, { level: l, month: m })).slice(1, -1))) return l
+  throw new Error('no buddy in the band')
 }
 
 const SS = { cwd: '/', surface: 'desktop', isInteractive: true } as const
@@ -258,7 +261,7 @@ test('an asked turn does not leak into the next turn', async ($, on) => {
 test('a quick burst is held for the minimum dwell, then the last state shows', async ($, on) => {
   const clock = await boot($, on)
   await clock.advance(1000)
-  const ui = await mountPane($)
+  const ui = await band($)
   await $.tool.call({ tool: 'Read', file_path: '/x' })
   await $.tool.call({ tool: 'Bash', command: 'make' })
   expect(await drawn(ui)).toMatch(/reading/)
@@ -287,7 +290,7 @@ test('a subagent starts, follows its own tool calls, finishes with done and is d
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'ok' }))
   const clock = await boot($, on)
-  const ui = await mountPane($)
+  const ui = await band($)
   await subStart($, 's1')
   const out = await drawn(ui)
   expect(count(out)).toBe(2)
@@ -299,7 +302,7 @@ test('a subagent starts, follows its own tool calls, finishes with done and is d
   await clock.advance(4000)
   expect(count(await drawn(ui))).toBe(2)
   await clock.advance(1500)
-  expect(count(await drawn(ui))).toBe(1)
+  expect(count(await drawn(ui))).toBe(0) // the sub is dropped and the idle band hides
   await ui.unmount()
 })
 
@@ -316,7 +319,7 @@ test('with 8 running subs a ninth is skipped, and a done one is evicted first', 
   await boot($, on)
   for (const id of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']) await $.tool.call(sub(id))
   await $.tool.call(sub('z'))
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(count(await drawn(ui))).toBe(9) // main + a..h
   await $.turn.complete(done('b'))
   await $.tool.call(sub('z'))
@@ -331,7 +334,7 @@ test('prompt.submit drops subs unseen for over 10 min; activity refreshes seen',
   const clock = await boot($, on)
   await $.tool.call(sub('gone'))
   await $.tool.call(sub('kept'))
-  const ui = await mountPane($)
+  const ui = await band($)
   await clock.advance(400_000)
   await $.tool.call(sub('kept', 'Grep'))
   await clock.advance(250_000)
@@ -979,7 +982,7 @@ test('housekeeping tools leave the last real tool shown', async ($, on) => {
 test('housekeeping tools do not break the helpers state or change a sub', async ($, on) => {
   helperMocks(on)
   const clock = await boot($, on)
-  const ui = await mountPane($)
+  const ui = await band($)
   await clock.advance(800)
   await $.tool.call(sub('s1', 'Edit'))
   await $.turn.complete(done())
@@ -1067,53 +1070,41 @@ test('thinking and done clear the detail', async ($, on) => {
   expect(end).not.toContain('again.ts')
 })
 
-test('the pane shows the detail on desktop and terminal', async ($, on) => {
+test('the band shows the detail on desktop and terminal', async ($, on) => {
   const clock = await boot($, on)
   await clock.advance(800)
   await $.tool.call({ tool: 'Edit', file_path: '/x/register.tsx' } as any)
   await clock.advance(800)
   for (const surface of ['desktop', 'terminal']) {
-    const ui = await mountPane($, surface)
+    const ui = await band($, surface)
     expect(await drawn(ui)).toContain('editing register.tsx')
     await ui.unmount()
   }
 })
 
-// ---------------------------------------------------------------- pane
+// ---------------------------------------------------------------- band sizes
 
-test('/buddy opens the pane; session.start, even twice, never does', async ($, on) => {
-  const c = await boot($, on)
-  await $.session.start(SS)
-  await c.advance(10)
-  expect(c.opened.length).toBe(0)
-  const out = await run($, 'buddy')
-  expect(out.text ?? '').toMatch(/opened/)
-  expect(c.opened.length).toBe(1)
-  expect(c.opened[0]).toMatchObject({ id: 'my-buddy', title: 'Buddy' })
-})
-
-test('the desktop pane draws the main Svg at 96 and subs at 52', async ($, on) => {
+test('the desktop band draws the main Svg at 64 and subs at 36', async ($, on) => {
   await boot($, on)
   await $.tool.call(sub('sub-1'))
   for (const surface of ['desktop', 'vscode', 'mobile']) {
-    const ui = await mountPane($, surface)
+    const ui = await band($, surface)
     const out = await drawn(ui)
     expect(count(out)).toBe(2)
-    expect(out).toMatch(/width=\\"96\\"|"width":96/)
-    expect(out).toMatch(/width=\\"52\\"|"width":52/)
+    expect(out).toMatch(/width=\\"64\\"|"width":64/)
+    expect(out).toMatch(/width=\\"36\\"|"width":36/)
     expect(out).not.toMatch(/isInteractive|borderStyle|backgroundColor/)
     await ui.unmount()
   }
 })
 
-test('the terminal pane draws the main buddy and subs as Text', async ($, on) => {
+test('the terminal band draws the main buddy and subs as Text', async ($, on) => {
   await boot($, on, { result: {} }, 'terminal')
   await $.tool.call(sub('sub-1'))
-  const ui = await mountPane($, 'terminal')
+  const ui = await band($, 'terminal')
   const out = await drawn(ui)
   expect(count(out)).toBe(0)
   expect(out).toMatch(/working on 1 helper/)
-  expect(out).toMatch(/reading/)
   await ui.unmount()
 })
 
@@ -1132,7 +1123,7 @@ test('/buddy-demo cycles the states and ends idle with no detail', async ($, on)
   const shown = await bandOut($)
   expect(count(shown)).toBe(1)
   expect(shown).not.toContain('before.ts')
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).toMatch(/thinking|idle/)
   await clock.advance(2500 * 2)
   expect(await drawn(ui)).toMatch(/reading|searching/)
@@ -1141,12 +1132,9 @@ test('/buddy-demo cycles the states and ends idle with no detail', async ($, on)
   expect(count(await drawn(ui))).toBe(2)
   await clock.advance(2500 * 8)
   const end = await drawn(ui)
-  expect(count(end)).toBe(1)
-  expect(end).toMatch(/idle/)
+  expect(count(end)).toBe(0) // idle again: the band hides
+  expect(end).toMatch(/engine/)
   expect(end).not.toMatch(/before\.ts|during\.ts/)
-  const out = await bandOut($)
-  expect(count(out)).toBe(0)
-  expect(out).toMatch(/engine/)
   await ui.unmount()
 })
 
@@ -1162,12 +1150,11 @@ test('a second session.start clears a leftover demo, and the demo can run again'
   const clock = await boot($, on)
   await run($, 'buddy-demo')
   await clock.advance(2500 * 7)
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(count(await drawn(ui))).toBe(2)
   await $.session.start({ ...SS })
   const after = await drawn(ui)
-  expect(count(after)).toBe(1)
-  expect(after).toMatch(/idle/)
+  expect(count(after)).toBe(0) // idle again: the band hides
   expect((await run($, 'buddy-demo')).text ?? '').toMatch(/Cycling/)
   await ui.unmount()
 })
@@ -1181,10 +1168,9 @@ for (const [name, stored] of [
   test(`${name} reads as the initial view`, async ($, on) => {
     on('state.get', { plugin: 'my-buddy', key: 'view' } as any, () => ({ value: { value: stored, version: 3 } }) as any)
     await boot($, on)
-    const ui = await mountPane($)
+    const ui = await band($)
     const out = await drawn(ui)
-    expect(count(out)).toBe(1)
-    expect(out).toMatch(/idle/)
+    expect(count(out)).toBe(0) // the initial view is idle: the band hides
     expect(out).not.toMatch(/old-sub|editing/)
     await ui.unmount()
   })
@@ -1243,18 +1229,19 @@ test('the cache line is hidden before any response and while a turn runs; the ba
   await $.turn.start({ text: 'hi', turnId: 't2' } as any)
   await $.classic.PermissionRequest({} as any) // waiting, but the turn is still running
   await clock.advance(800)
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).not.toContain('cache')
   await $.turn.complete(done(undefined, 't2'))
   expect(await drawn(ui)).toContain('cache')
   await ui.unmount()
 })
 
-test('a mounted pane counts down on its own; the ticks stop once the cache is cold', { options: { cacheTtlMinutes: 5 } }, async ($, on) => {
+test('a mounted band counts down on its own; the ticks stop once the cache is cold', { options: { cacheTtlMinutes: 5 } }, async ($, on) => {
   stepMocks(on)
   const clock = await boot($, on)
   await reply($)
-  const ui = await mountPane($)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }], { tokens: 1000, window: 200_000 })
+  const ui = await band($)
   const first = await drawn(ui)
   await clock.advance(5000)
   expect(await drawn(ui)).not.toBe(first)
@@ -1297,15 +1284,13 @@ test('terminal: the cache line joins the label row with one meter and never adds
   expect(capped.match(/"key":"meter-/g)?.length).toBe(1)
 })
 
-test('the pane shows the cache line once the turn is over; a subagent response does not refresh it', async ($, on) => {
+test('the band shows the cache line once the turn is over; a subagent response does not refresh it', async ($, on) => {
   stepMocks(on)
   const clock = await boot($, on)
   await reply($)
   await clock.advance(55 * 60_000)
   await reply($, 'a1')
-  const ui = await mountPane($)
-  expect(await drawn(ui)).toContain('cache 5:00')
-  await ui.unmount()
+  expect(await cacheBand($)).toContain('cache 5:00')
 })
 
 test('cacheTtlMinutes is honoured: 5 gives a 5 minute window, then cold', { options: { cacheTtlMinutes: 5 } }, async ($, on) => {
@@ -1375,7 +1360,7 @@ test('/model forgets the cache: the line hides until the next response', async (
 test('turn.start with an agentId shows the helper before any tool call; a resumed one survives its old drop timer', async ($, on) => {
   stepMocks(on)
   const clock = await boot($, on)
-  const ui = await mountPane($)
+  const ui = await band($)
   await $.turn.start({ text: 'x', turnId: 's1', agentId: 'a1' } as any)
   expect(await drawn(ui)).toContain(`subagent buddy, ${LABELS.working}`)
   expect(count(await drawn(ui))).toBe(2)
@@ -1572,7 +1557,7 @@ const submit = async ($: any, p: any) => {
   return r
 }
 
-test('a commit earns +5 and +10 once a day, shown as a floater and a level line; --amend and failures earn nothing', async ($, on) => {
+test('a commit earns +5 and +10 once a day, shown as a floater and in the /buddy reply; --amend and failures earn nothing', async ($, on) => {
   const store = new Map<string, unknown>()
   const clock = await boot($, on, { result: {}, text: '[main abc1234] msg' }, 'desktop', store)
   await $.tool.call({ tool: 'Bash', command: 'git commit --amend -m x' } as any)
@@ -1582,11 +1567,8 @@ test('a commit earns +5 and +10 once a day, shown as a floater and a level line;
   expect([...store.entries()].find(([k]) => k.startsWith('xp:'))?.[1]).toMatchObject({ xp: 15 })
   await $.tool.call({ tool: 'Bash', command: 'git commit -m y' } as any)
   expect([...store.entries()].find(([k]) => k.startsWith('xp:'))?.[1]).toMatchObject({ xp: 20 })
-  const ui = await mountPane($)
-  const t = await drawn(ui)
-  expect(t).toContain('Lv 1 · 20 / 200 XP')
-  expect(t).toContain('+20')
-  await ui.unmount()
+  expect(await bandOut($)).toContain('+20')
+  expect((await xpText($)).split('\n')[0]).toBe('Lv 1 · 20 / 200 XP')
 })
 
 test('a turn that used a tool earns XP; a thanks prompt earns +2', async ($, on) => {
@@ -1807,9 +1789,7 @@ test('xp: a new day resets the caps but not the month total', async ($, on) => {
   await c.advance(DAY)
   for (let i = 0; i < 12; i++) await bash(c, $, 'git commit -m z', OK_COMMIT)
   expect(xpSum(st)).toBe(120)
-  const ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 120 / 200 XP')
-  await ui.unmount()
+  expect((await xpText($)).split('\n')[0]).toBe('Lv 1 · 120 / 200 XP')
 })
 
 test('xp: a new day lets another session earn its own capped share with the old counters ignored', async ($, on) => {
@@ -1829,12 +1809,10 @@ test('xp: month rollover drops last month, golden when it reached 2500, not belo
   await levelBoot($, on, st)
   expect(xpKeys(st)).toEqual(['xp:2026-11:s1'])
   expect(st.get('goldenMonths')).toEqual(['2026-10'])
-  const ui = await mountPane($)
-  const t = await drawn(ui)
+  const t = await xpText($)
   expect(t).toContain('Lv 1 · 5 / 200 XP')
   expect(t).toContain('✨ Oct 2026')
   expect(t).not.toContain('Sep 2026')
-  await ui.unmount()
 })
 
 test('xp: the month turning over while the session runs rolls over and restarts the total', async ($, on) => {
@@ -1850,51 +1828,88 @@ test('xp: the month turning over while the session runs rolls over and restarts 
   expect(xpSum(st)).toBe(2)
 })
 
-test('xp: pane lines per level', async ($, on) => {
+test('xp: the /buddy reply per level: the level line, today and the next reward', async ($, on) => {
   const st = new Map<string, unknown>()
-  const c = await levelBoot($, on, st)
-  const cases: [number, string][] = [
-    [0, 'Lv 1 · 0 / 200 XP'], [199, 'Lv 1 · 199 / 200 XP'], [200, 'Lv 2 · 200 / 900 XP'], [340, 'Lv 2 · 340 / 900 XP'],
-    [900, 'Lv 3 · 900 / 2,500 XP'], [2499, 'Lv 3 · 2,499 / 2,500 XP'], [2500, 'Lv 4 · 2,500 XP ✨'], [2612, 'Lv 4 · 2,612 XP ✨'],
+  await levelBoot($, on, st)
+  const cases: [number, string, string][] = [
+    [0, 'Lv 1 · 0 / 200 XP', 'Today +0 XP · next: bow tie in 200 XP'],
+    [199, 'Lv 1 · 199 / 200 XP', 'Today +0 XP · next: bow tie in 1 XP'],
+    [200, 'Lv 2 · 200 / 900 XP', 'Today +0 XP · next: Nov knit beanie in 700 XP'],
+    [340, 'Lv 2 · 340 / 900 XP', 'Today +0 XP · next: Nov knit beanie in 560 XP'],
+    [900, 'Lv 3 · 900 / 2,500 XP', 'Today +0 XP · next: golden body in 1,600 XP'],
+    [2499, 'Lv 3 · 2,499 / 2,500 XP', 'Today +0 XP · next: golden body in 1 XP'],
+    [2500, 'Lv 4 · 2,500 XP ✨', 'Today +0 XP'],
+    [2612, 'Lv 4 · 2,612 XP ✨', 'Today +0 XP'],
   ]
-  for (const [xp, text] of cases) {
-    await c.advance(6_000) // the pane reuses a reading younger than 5 s
+  for (const [xp, line1, line2] of cases) {
     st.set('xp:2026-11:s1', { day: '2026-11-13', n: {}, xp })
-    const ui = await mountPane($)
-    expect(await drawn(ui)).toContain(text)
-    await ui.unmount()
+    expect((await xpText($)).split('\n')).toEqual([line1, line2])
   }
 })
 
-test('xp: golden months line lists the finished months; none when empty', async ($, on) => {
-  const st = new Map<string, unknown>([['goldenMonths', ['2026-03', '2026-09']]])
-  const c = await levelBoot($, on, st)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('✨ Mar 2026, Sep 2026')
-  await ui.unmount()
-  st.delete('goldenMonths')
-  await c.advance(6_000)
-  ui = await mountPane($)
-  expect(await drawn(ui)).not.toContain('✨')
-  await ui.unmount()
+test("xp: the /buddy reply sums today's counts over sessions, not older days", async ($, on) => {
+  const st = new Map<string, unknown>([
+    ['xp:2026-11:a', { day: '2026-11-13', n: { turn: 20, commit: 2, firstCommit: 1 }, xp: 40 }],
+    ['xp:2026-11:b', { day: '2026-11-13', n: { pr: 1, green: 1, thanks: 2, back: 1, firstTurn: 1 }, xp: 39 }],
+    ['xp:2026-11:c', { day: '2026-11-12', n: { turn: 40 }, xp: 40 }],
+  ])
+  await levelBoot($, on, st)
+  // 20 + 10 + 10 + 20 + 3 + 4 + 2 + 10 = 79 today; 119 XP in all
+  expect((await xpText($)).split('\n')).toEqual(['Lv 1 · 119 / 200 XP', 'Today +79 XP · next: bow tie in 81 XP'])
 })
 
-test('xp: the +N floater combines commit bonuses, shows in pane and band, and clears after about 4 s', async ($, on) => {
+test("xp: the Lv 3 reward in the /buddy reply is this month's hat", () => {
+  const hats = ['party hat', 'heart headband', 'clover', 'rain hood', 'flower crown', 'sunglasses', 'strawberry', 'sun hat', 'graduation cap', 'pumpkin', 'knit beanie', 'snow cap']
+  const mons = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  for (let m = 0; m < 12; m++) {
+    const out = xpSummary({ month: `2026-${String(m + 1).padStart(2, '0')}`, total: 300, today: {}, golden: [] }, m)
+    expect(out.split('\n')[1]).toBe(`Today +0 XP · next: ${mons[m]} ${hats[m]} in 600 XP`)
+  }
+})
+
+test('xp: the /buddy reply has a golden line only when there are golden months', async ($, on) => {
+  const st = new Map<string, unknown>([['goldenMonths', ['2026-03', '2026-09']]])
+  await levelBoot($, on, st)
+  expect((await xpText($)).split('\n')[2]).toBe('✨ Mar 2026, Sep 2026')
+  st.delete('goldenMonths')
+  expect((await xpText($)).split('\n').length).toBe(2)
+  expect(await xpText($)).not.toContain('✨')
+})
+
+test("xp: /buddy reads fresh, not the render cache, and says so when reading fails", async ($, on) => {
+  class Broken extends Map<string, unknown> {
+    broken = false
+    keys(): MapIterator<string> {
+      if (this.broken) throw new Error('store down')
+      return super.keys()
+    }
+  }
+  const st = new Broken()
+  await levelBoot($, on, st)
+  expect((await xpText($)).split('\n')[0]).toBe('Lv 1 · 0 / 200 XP')
+  st.set('xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 50 }) // inside the 5 s render window
+  expect((await xpText($)).split('\n')[0]).toBe('Lv 1 · 50 / 200 XP')
+  st.broken = true
+  expect(await xpText($)).toBe("XP isn't available right now.")
+})
+
+test('xp: a bare /buddy never opens a pane and mentions no cache', async ($, on) => {
+  const c = await kwBoot($, on)
+  await reply($)
+  const t = await xpText($)
+  expect(t).not.toMatch(/cache|pane|warm/i)
+  expect((await buddy($, '   ')).text).toBe(t)
+  expect(c.clock.opened.length).toBe(0)
+})
+
+test('xp: the +N floater combines commit bonuses, shows on the band, and clears after about 4 s', async ($, on) => {
   const st = new Map<string, unknown>()
   const c = await levelBoot($, on, st)
   await bash(c, $, 'git commit -m x', OK_COMMIT)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('+15')
-  await ui.unmount()
   expect(await bandOut($)).toContain('+15')
   await c.advance(3_000)
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('+15')
-  await ui.unmount()
+  expect(await bandOut($)).toContain('+15')
   await c.advance(1_500)
-  ui = await mountPane($)
-  expect(await drawn(ui)).not.toContain('+15')
-  await ui.unmount()
   expect(await bandOut($)).not.toContain('+15')
 })
 
@@ -1906,17 +1921,17 @@ test('xp: floaters for pr and green; none for turn, thanks or back', async ($, o
   await $.tool.call({ tool: 'Read', file_path: '/x' } as any)
   await $.turn.complete(done())
   expect(xpSum(st)).toBe(15)
-  let ui = await mountPane($)
+  let ui = await band($)
   expect(await drawn(ui)).not.toMatch(/\+\d/)
   await ui.unmount()
   await bash(c, $, 'gh pr create', { result: {}, text: 'https://github.com/a/b/pull/7' })
-  ui = await mountPane($)
+  ui = await band($)
   expect(await drawn(ui)).toContain('+20')
   await ui.unmount()
   await c.advance(5_000)
   await bash(c, $, 'npm test', { result: {}, isError: true })
   await bash(c, $, 'npm test', { result: {} })
-  ui = await mountPane($)
+  ui = await band($)
   expect(await drawn(ui)).toContain('+3')
   await ui.unmount()
 })
@@ -1927,7 +1942,7 @@ test('xp: an award while a floater shows adds to it', async ($, on) => {
   await bash(c, $, 'gh pr create', { result: {}, text: 'https://github.com/a/b/pull/7' })
   await c.advance(1_000)
   await bash(c, $, 'gh pr create', { result: {}, text: 'https://github.com/a/b/pull/7' })
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).toContain('+40')
   await ui.unmount()
 })
@@ -1950,12 +1965,12 @@ test('art: the main buddy changes with the level; level 1 is plain; hats differ 
   }
 })
 
-test('art: the pane gives a hat only to the main buddy, never to subagents', async ($, on) => {
+test('art: the band gives a hat only to the main buddy, never to subagents', async ($, on) => {
   const st = new Map<string, unknown>([['xp:2026-11:s1', { day: '2026-11-13', n: {}, xp: 3000 }]])
   await levelBoot($, on, st)
   await $.turn.start({ text: 'x', turnId: 't1' } as any)
   await subStart($, 'a1')
-  const ui = await mountPane($)
+  const ui = await band($)
   const t = await drawn(ui)
   expect(count(t)).toBe(2)
   expect((t.match(/#ffd54a/g) ?? []).length).toBeGreaterThan(0)
@@ -2018,7 +2033,7 @@ test('xp: a prompt queued mid-turn keeps the running turn\'s work', async ($, on
   expect(xpSum(st)).toBe(11)
 })
 
-test('xp: the pane reuses the reading for 5 s; a real refresh reads every key again', async ($, on) => {
+test('xp: the band reuses the reading for 5 s; a real refresh reads every key again', async ($, on) => {
   class Counting extends Map<string, unknown> {
     gets: string[] = []
     keyCalls = 0
@@ -2032,26 +2047,19 @@ test('xp: the pane reuses the reading for 5 s; a real refresh reads every key ag
     }
   }
   const st = new Counting([
-    ['xp:2026-11:old1', { day: '2026-11-10', n: {}, xp: 50 }],
-    ['xp:2026-11:old2', { day: '2026-11-11', n: {}, xp: 30 }],
+    ['xp:2026-11:old1', { day: '2026-11-10', n: {}, xp: 150 }],
+    ['xp:2026-11:old2', { day: '2026-11-11', n: {}, xp: 40 }],
   ])
   const c = await levelBoot($, on, st)
   const reads = (k: string) => st.gets.filter(x => x === k).length
   expect(reads('xp:2026-11:old1')).toBe(1)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 80 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(1) // 190 XP
   const calls = st.keyCalls
-  for (let i = 0; i < 3; i++) {
-    ui = await mountPane($)
-    await ui.unmount()
-  }
+  for (let i = 0; i < 3; i++) await bandOut($)
   expect(st.keyCalls).toBe(calls) // renders inside the window do not read the store
   await c.advance(6_000)
   st.set('xp:2026-11:old3', { day: '2026-11-12', n: {}, xp: 20 })
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 100 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(2) // 210 XP
   expect(st.keyCalls).toBe(calls + 1)
   expect(reads('xp:2026-11:old1')).toBe(2) // no cache: every key is read on a real refresh
   expect(reads('xp:2026-11:old3')).toBe(1)
@@ -2076,14 +2084,14 @@ test('xp: a throwing store during leveling leaves the normal buddy states alone'
   await settle()
   await $.turn.start({ text: 'x', turnId: 't1' } as any)
   await c.advance(800)
-  let ui = await mountPane($)
+  let ui = await band($)
   expect(await drawn(ui)).toContain(LABELS.thinking)
   await ui.unmount()
   await bash(c, $, 'git commit -m x', OK_COMMIT)
   await c.advance(800)
   await $.turn.complete(done())
   await c.advance(800)
-  ui = await mountPane($)
+  ui = await band($)
   const t = await drawn(ui)
   expect(t).toContain(LABELS.done)
   await ui.unmount()
@@ -2091,59 +2099,36 @@ test('xp: a throwing store during leveling leaves the normal buddy states alone'
 
 // ---- leveling, review-fix edge cases (tester)
 
-test('xp: the pane shows XP at once after an award, inside the 5 s window', async ($, on) => {
-  const st = new Map<string, unknown>()
+test('xp: an award lifts the level shown on the band at once, inside the 5 s window', async ($, on) => {
+  const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 180 }]])
   const c = await levelBoot($, on, st)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 0 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(1)
   await c.advance(1_000)
-  await bash(c, $, 'git commit -m x', OK_COMMIT)
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 15 / 200 XP')
-  await ui.unmount()
+  await bash(c, $, 'git commit -m x', OK_COMMIT) // 195
+  expect(await bandLevel($)).toBe(1)
   await c.advance(1_000)
-  await workTurn($)
+  await workTurn($) // 206
   await settle()
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 26 / 200 XP')
-  await ui.unmount()
-})
-
-test('xp: an award also lifts the level shown at once (Lv 1 to Lv 2 inside the window)', async ($, on) => {
-  const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 190 }]])
-  const c = await levelBoot($, on, st)
-  await bash(c, $, 'git commit -m x', OK_COMMIT)
-  const ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 2 · 205 / 900 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(2)
 })
 
 test('xp: a record removed at rollover is not counted, and a new one under the same key is read afresh', async ($, on) => {
-  const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 50 }]])
+  const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 250 }]])
   const c = await levelBoot($, on, st)
   st.delete('xp:2026-11:other')
   await c.advance(6_000)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 0 / 200 XP')
-  await ui.unmount()
-  st.set('xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 7 })
+  expect(await bandLevel($)).toBe(1)
+  st.set('xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 300 })
   await c.advance(6_000)
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 7 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(2)
 })
 
 test('xp: the month turning over with a reading younger than 5 s is read again at once', async ($, on) => {
   const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-29', n: {}, xp: 300 }]])
   const c = await levelBoot($, on, st, new Date(2026, 10, 30, 23, 59, 59, 0).getTime())
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 2 · 300 / 900 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(2)
   await c.advance(1_500) // now Dec 1, reading is 1.5 s old
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 0 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(1)
   expect(st.has('xp:2026-11:other')).toBe(false)
 })
 
@@ -2175,7 +2160,7 @@ test('xp: prompt.submit sets thinking before the background XP work finishes', a
   const c = await levelBoot($, on, st)
   await $.prompt.submit({ text: 'thanks' } as any)
   await c.advance(900)
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).toContain(LABELS.thinking)
   await ui.unmount()
   await settle()
@@ -2196,7 +2181,7 @@ test('xp: turn.complete shows done even when the award throws', async ($, on) =>
   st.broken = true
   await $.turn.complete(done())
   await c.advance(800)
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).toContain(LABELS.done)
   await ui.unmount()
   // the failed award does not poison the queue
@@ -2277,14 +2262,10 @@ test('xp: gh pr create is read per line, and a trailing comment is ignored', asy
 test('xp: a session resumed on a later day is read again, and a stale read never overwrites an award', async ($, on) => {
   const st = new Map<string, unknown>([['xp:2026-11:other', { day: '2026-11-12', n: {}, xp: 50 }]])
   const c = await levelBoot($, on, st)
-  let ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 50 / 200 XP')
-  await ui.unmount()
-  st.set('xp:2026-11:other', { day: '2026-11-13', n: { turn: 4 }, xp: 54 })
+  expect(await bandLevel($)).toBe(1)
+  st.set('xp:2026-11:other', { day: '2026-11-13', n: { turn: 4 }, xp: 254 })
   await c.advance(6_000)
-  ui = await mountPane($)
-  expect(await drawn(ui)).toContain('Lv 1 · 54 / 200 XP')
-  await ui.unmount()
+  expect(await bandLevel($)).toBe(2)
 })
 
 test('xp: a read in flight during an award does not store its older total', async () => {
@@ -2331,20 +2312,18 @@ test('xp: a prompt queued mid-turn does not start a new worked turn; the next id
   expect(xpSum(st)).toBe(0)
 })
 
-test('xp: pane line separators at every level, in the terminal pane too', async ($, on) => {
+test('xp: the /buddy reply uses thousands separators at every level', async ($, on) => {
   const st = new Map<string, unknown>()
-  const c = await levelBoot($, on, st)
-  const cases: [number, string][] = [
-    [1200, 'Lv 3 · 1,200 / 2,500 XP'], [999, 'Lv 3 · 999 / 2,500 XP'], [1000, 'Lv 3 · 1,000 / 2,500 XP'], [12_345, 'Lv 4 · 12,345 XP ✨'],
+  await levelBoot($, on, st)
+  const cases: [number, string, string][] = [
+    [1200, 'Lv 3 · 1,200 / 2,500 XP', 'Today +0 XP · next: golden body in 1,300 XP'],
+    [999, 'Lv 3 · 999 / 2,500 XP', 'Today +0 XP · next: golden body in 1,501 XP'],
+    [1000, 'Lv 3 · 1,000 / 2,500 XP', 'Today +0 XP · next: golden body in 1,500 XP'],
+    [12_345, 'Lv 4 · 12,345 XP ✨', 'Today +0 XP'],
   ]
-  for (const surface of ['desktop', 'terminal']) {
-    for (const [xp, text] of cases) {
-      await c.advance(6_000)
-      st.set('xp:2026-11:s1', { day: '2026-11-13', n: {}, xp })
-      const ui = await mountPane($, surface)
-      expect(await drawn(ui)).toContain(text)
-      await ui.unmount()
-    }
+  for (const [xp, line1, line2] of cases) {
+    st.set('xp:2026-11:s1', { day: '2026-11-13', n: {}, xp })
+    expect((await xpText($)).split('\n')).toEqual([line1, line2])
   }
 })
 
@@ -2366,17 +2345,18 @@ test('xp: simultaneous renders share one read, and a failed read is not retried 
   }
   const st = new Counting()
   const c = await levelBoot($, on, st)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }]) // a meter row keeps the band up while idle
   await c.advance(6_000)
   const before = st.keyCalls
-  const [a, b, d] = await Promise.all([mountPane($), mountPane($, 'terminal'), mountPane($, 'vscode')])
+  const [a, b, d] = await Promise.all([band($), band($, 'terminal'), band($, 'vscode')])
   expect([before, st.keyCalls]).toEqual([before, before + 1])
   await Promise.all([a, b, d].map(u => u.unmount()))
   await c.advance(6_000)
   st.broken = true
   const after = st.keyCalls
   for (let i = 0; i < 3; i++) {
-    const ui = await mountPane($)
-    expect(await drawn(ui)).toContain('Lv 1')
+    const ui = await band($)
+    expect(await drawn(ui)).toContain('buddy, ')
     await ui.unmount()
   }
   expect([after, st.keyCalls]).toEqual([after, after + 1])
@@ -3023,18 +3003,18 @@ test('background: a task stopped during the demo is not resurrected after it end
   expect(count(await bandOut($))).toBe(0)
 })
 
-test('background: the label shows on the terminal band and the pane', async ($, on) => {
+test('background: the label shows on the terminal and desktop band', async ($, on) => {
   const c = await bgBoot($, on)
   await c.start(NPM, { backgroundTaskId: 'b1' })
   await endIdle(c)
   const term = await bandOut($, 'terminal')
   expect(term).toContain(`${LABELS.background} npm`)
-  const ui = await mountPane($)
-  const pane = await drawn(ui)
-  expect(pane).toContain(`${LABELS.background} npm`)
-  expect(pane).toMatch(fillRe(SCREEN))
+  const ui = await band($)
+  const desk = await drawn(ui)
+  expect(desk).toContain(`${LABELS.background} npm`)
+  expect(desk).toMatch(fillRe(SCREEN))
   await ui.unmount()
-  const ui2 = await mountPane($, 'terminal')
+  const ui2 = await band($, 'terminal')
   expect(await drawn(ui2)).toContain(`${LABELS.background} npm`)
   await ui2.unmount()
 })
@@ -3549,14 +3529,6 @@ test('keep-warm: switching on arms the ping at once for a warm cache; the overri
   expect(c.pings.length).toBe(1)
 })
 
-test('keep-warm: plain /buddy still opens the pane', async ($, on) => {
-  const c = await kwBoot($, on)
-  const r = await buddy($, '')
-  expect(r.text).toMatch(/pane opened/)
-  expect(c.clock.opened.length).toBe(1)
-  expect((await buddy($, '   ')).text).toMatch(/pane opened/)
-})
-
 test('keep-warm: the per-session override survives a reload but not a new session id', async ($, on) => {
   const c = await kwBoot($, on)
   await reply($)
@@ -3907,10 +3879,10 @@ test('keep-warm: the cache line says warm on the terminal band too, with the sam
   expect(out).toContain('warm')
 })
 
-test('keep-warm: a pane shows the warm cache line', async ($, on) => {
+test('keep-warm: the band shows the warm cache line', async ($, on) => {
   await kwBoot($, on)
   await reply($)
-  const ui = await mountPane($)
+  const ui = await band($)
   expect(await drawn(ui)).toContain('warm')
   await ui.unmount()
 })
@@ -4473,4 +4445,36 @@ test('keep-warm r3: a failing /buddy keepwarm toggle within 30 s of a ping never
   await buddy($, 'keepwarm on', { kind: 'plugin', name: 'x' })
   await c.clock.advance(10_000)
   expect(c.pings.length).toBe(1)
+})
+
+// ---- /buddy XP reply, gap tests
+
+test('xp: /buddy earns nothing itself, even after a long idle with a warm cache that would pay the coming-back bonus', async ($, on) => {
+  const st = new Map<string, unknown>([['cacheStamp:s1', { at: NOV13, ttlMs: 36_000_000 }]])
+  const c = await levelBoot($, on, st)
+  await c.advance(300_000)
+  const before = JSON.stringify([...st.entries()])
+  for (let i = 0; i < 3; i++) expect((await xpText($)).split('\n')[0]).toBe('Lv 1 · 0 / 200 XP')
+  await settle()
+  expect(JSON.stringify([...st.entries()])).toBe(before)
+  expect(xpKeys(st)).toEqual([])
+})
+
+test("xp: the /buddy reply's Today drops to 0 across midnight while the month total stays", async ($, on) => {
+  const st = new Map<string, unknown>()
+  const c = await levelBoot($, on, st, new Date(2026, 10, 13, 23, 59, 0).getTime())
+  await bash(c, $, 'git commit -m x', OK_COMMIT)
+  expect((await xpText($)).split('\n')).toEqual(['Lv 1 · 15 / 200 XP', 'Today +15 XP · next: bow tie in 185 XP'])
+  await c.advance(2 * 60_000)
+  expect((await xpText($)).split('\n')).toEqual(['Lv 1 · 15 / 200 XP', 'Today +0 XP · next: bow tie in 185 XP'])
+})
+
+test('buddy: unknown arguments give the exact usage line; keepwarm args are case-insensitive; no pane either way', async ($, on) => {
+  const c = await kwBoot($, on)
+  await reply($)
+  for (const a of ['help', 'xp', 'keepwarm maybe', 'keepwarm on off', 'pane'])
+    expect((await buddy($, a)).text).toBe('Usage: /buddy [keepwarm [on|off]]')
+  expect((await buddy($, '  KeepWarm   OFF ')).text).not.toMatch(/Usage/)
+  expect((await buddy($, 'KEEPWARM ON')).text).not.toMatch(/Usage/)
+  expect(c.clock.opened.length).toBe(0)
 })

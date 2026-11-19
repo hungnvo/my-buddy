@@ -5,7 +5,7 @@ import type { BuddyAwaiting, BuddyCache, BuddyKeepWarm, BuddyLimit, BuddyLook, B
 import { EMOJI, LABELS, buddySvg } from './art'
 import type { Src } from './level'
 import {
-  award, commitOutput, goldenLine, isCommit, isPrCreate, isTestCmd, isThanks, levelOf, prOutput, refreshXp, xpLine, freshXp,
+  award, commitOutput, isCommit, isPrCreate, isTestCmd, isThanks, levelOf, prOutput, refreshXp, xpSummary, freshXp,
 } from './level'
 
 type Api = EngineInterface
@@ -58,9 +58,6 @@ const COMPACT_MIN_TOKENS = 30_000 // below this a compaction is not worth it
 const PING_TEXT = 'Keep-alive ping from my-buddy to keep the prompt cache warm. Reply with just "ok" and do nothing else.'
 const PLUGIN_NAME = 'my-buddy'
 const MAX_SUBS = 8
-const PANE = 'my-buddy'
-const MAIN_PX = 96
-const SUB_PX = 52
 const BAND_MAIN_PX = 64
 const BAND_SUB_PX = 36
 const FLOAT_MS = 4000 // how long a "+N" stays beside the buddy
@@ -645,12 +642,12 @@ async function earn($: Api, srcs: Src[]) {
 const floatText = (now: number) => (floater && now < floater.until ? `+${floater.n}` : '')
 
 // What the main buddy wears, and the month's reading it comes from (read again when the month turns).
-async function xpNow($: Api): Promise<{ look: BuddyLook; total: number; golden: string[] } | null> {
+async function xpNow($: Api): Promise<{ look: BuddyLook } | null> {
   try {
     const now = await $.clock.now()
     const st = await freshXp($, now)
     if (!st) return null
-    return { look: { level: levelOf(st.total), month: new Date(now).getMonth() }, total: st.total, golden: st.golden }
+    return { look: { level: levelOf(st.total), month: new Date(now).getMonth() } }
   } catch {
     return null
   }
@@ -729,10 +726,15 @@ async function dropSub($: Api, id: string) {
   await update($, view, v => ({ ...v, subs: v.subs.filter(s => s.id !== id) }))
 }
 
-// Opens the pane on the person's ask and says how it went.
-async function openAsked($: Api): Promise<string> {
-  const opened = await $.ui.open({ id: PANE, title: 'Buddy' })
-  return opened.isPlaced ? 'Buddy pane opened.' : `Buddy pane not shown: ${opened.reason ?? 'no room for a pane here'}`
+// The reply to a bare /buddy: level, today's XP with the next reward, and the golden months.
+async function xpReply($: Api): Promise<string> {
+  try {
+    const now = await $.clock.now()
+    const st = await refreshXp($, now)
+    return xpSummary(st, new Date(now).getMonth())
+  } catch {
+    return "XP isn't available right now."
+  }
 }
 
 async function demoStep($: Api, i: number): Promise<void> {
@@ -958,7 +960,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await safe(() => $.command.register({ name: 'buddy-demo', description: 'Cycle the buddy through every animation' }))
-    await safe(() => $.command.register({ name: 'buddy', description: 'Open the buddy pane' }))
+    await safe(() => $.command.register({ name: 'buddy', description: "Show your buddy's level and XP" }))
     // A reload runs this again with the stored view but fresh timers: clear leftover demo state.
     await safe(() => resetLeftovers($))
     await refreshAuth($)
@@ -1201,7 +1203,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'buddy' }, async ($, e) => {
     const args = (e.args ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
     if (isPerson(e.origin)) await personHere($, e.origin) // the person ran a command
-    if (args.length === 0) return { text: await openAsked($) }
+    if (args.length === 0) return { text: await xpReply($) }
     if (args[0] !== 'keepwarm' || args.length > 2 || (args[1] !== undefined && args[1] !== 'on' && args[1] !== 'off')) {
       return { text: 'Usage: /buddy [keepwarm [on|off]]' }
     }
@@ -1209,7 +1211,7 @@ export const register: Register = (on, options) => {
     await setKeepWarm($, next)
     return { text: await keepWarmReply($) }
   }).catch(() => ({
-    text: 'Buddy pane not shown.',
+    text: "/buddy didn't work right now.",
   }))
 
   on('command.run', { command: 'buddy-demo' }, async $ => {
@@ -1315,64 +1317,6 @@ export const register: Register = (on, options) => {
             height={BAND_MAIN_PX}
           />
         </Box>
-      </Box>
-    )
-  }).catch(($, e, next) => next(e))
-
-  // The pane is on request only (/buddy); docked beside the chat, inline above the prompt when the surface has no dock.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
-    const v = await read($, view)
-    const xp = await xpNow($)
-    const xpText = xp ? xpLine(xp.total) : ''
-    const goldText = xp ? goldenLine(xp.golden) : ''
-    const bonus = floatText(await $.clock.now())
-    const line = mainRunning ? null : cacheLine(await currentCache($), await $.clock.now(), await pingArmed($))
-    if (e.surface === 'terminal') {
-      const { Box, Text } = $.ui.resolve(e)
-      return (
-        <Box flexDirection="column" alignItems="center">
-          <Text>{`${EMOJI[v.main]} ${labelOf(v)}${bonus && ` ${bonus}`}`}</Text>
-          {xpText && <Text dimColor>{xpText}</Text>}
-          {goldText && <Text dimColor>{goldText}</Text>}
-          {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{line.text}</Text>}
-          {v.subs.map(s => (
-            <Text key={`sub-${s.id}`} dimColor>{`${EMOJI[s.state]} ${LABELS[s.state]}`}</Text>
-          ))}
-        </Box>
-      )
-    }
-    const { Box, Text, Svg } = $.ui.resolve(e)
-    return (
-      <Box flexDirection="column" alignItems="center">
-        <Svg
-          key="main"
-          source={buddySvg(v.main, 0, MAIN_PX, xp?.look)}
-          alt={`buddy, ${LABELS[v.main]}`}
-          width={MAIN_PX}
-          height={MAIN_PX}
-        />
-        <Box flexDirection="row">
-          <Text>{labelOf(v)}</Text>
-          {bonus && <Text color="green">{` ${bonus}`}</Text>}
-        </Box>
-        {xpText && <Text dimColor>{xpText}</Text>}
-        {goldText && <Text dimColor>{goldText}</Text>}
-        {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{line.text}</Text>}
-        {v.subs.length > 0 && (
-          <Box flexDirection="row" flexWrap="wrap" justifyContent="center" columnGap={1}>
-            {v.subs.map(s => (
-              <Box key={`sub-${s.id}`} flexDirection="column" alignItems="center">
-                <Svg
-                  source={buddySvg(s.state, 1 + (hash(s.id) % 4), SUB_PX)}
-                  alt={`subagent buddy, ${LABELS[s.state]}`}
-                  width={SUB_PX}
-                  height={SUB_PX}
-                />
-                <Text dimColor>{LABELS[s.state]}</Text>
-              </Box>
-            ))}
-          </Box>
-        )}
       </Box>
     )
   }).catch(($, e, next) => next(e))

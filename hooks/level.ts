@@ -190,3 +190,19 @@ export const isTestCmd = (cmd: string) => TEST_CMD.test(cmd)
 const THANKS = /\b(?:thanks|thank\s+(?:you|u)|thx|ty|merci|gracias|danke|arigat(?:o|ou)|obrigad[oa])\b/i
 const THANKS_WIDE = /cảm ơn|cám ơn|谢谢|謝謝|ありがとう/i
 export const isThanks = (text: string) => THANKS.test(text) || THANKS_WIDE.test(text)
+
+// What reaching a level unlocks; the hat is the current month's (names match the HATS sprites in art.ts).
+const HAT_NAMES = [
+  'party hat', 'heart headband', 'clover', 'rain hood', 'flower crown', 'sunglasses',
+  'strawberry', 'sun hat', 'graduation cap', 'pumpkin', 'knit beanie', 'snow cap',
+]
+export const rewardOf = (level: number, month: number) =>
+  level === 2 ? 'bow tie' : level === 3 ? `${MONTHS[month]} ${HAT_NAMES[month]}` : 'golden body'
+
+// The reply to a bare /buddy; month is 0 (January) to 11.
+export function xpSummary(st: XpState, month: number): string {
+  const lv = levelOf(st.total)
+  const gained = (Object.entries(st.today) as [Src, number][]).reduce((a, [s, c]) => a + (RULES[s]?.xp ?? 0) * c, 0)
+  const next = lv >= MAX_LEVEL ? '' : ` · next: ${rewardOf(lv + 1, month)} in ${withSep(LEVELS[lv]! - st.total)} XP`
+  return [xpLine(st.total), `Today +${gained} XP${next}`, goldenLine(st.golden)].filter(Boolean).join('\n')
+}
