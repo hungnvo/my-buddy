@@ -16,7 +16,18 @@ Then run `/reload-plugins`. On the 5-minute prompt cache, add `--config cacheTtl
 ## Commands
 
 - `/buddy` opens the buddy pane.
+- `/buddy keepwarm [on|off]` turns keep-warm on or off for this session (no argument toggles it) and says how big the context is.
 - `/buddy-demo` plays every animation.
+
+## Keep-warm
+
+A cold prompt cache means the whole context is written again at 1.25-2x the input price, instead of read at a small fraction of it. While you are away, Mochi sends a tiny ping (`Keep-alive ping from my-buddy... Reply with just "ok"`) about 3 minutes before the cache goes cold (1 minute on the 5-minute tier), so the next real prompt still hits a warm cache. It is on by default, and the cache line reads `cache 42m · warm` while it is armed.
+
+- Each ping reads your whole cached context once (about 150k cached tokens for a 150k context) and writes a one-word reply, far less than a cold restart.
+- It never pings while a turn runs, while Claude is waiting for you, while the prompt box has a draft, during the demo, or once the cache is cold. Background helpers and tasks don't stop it.
+- After 5 pings in a row with no activity from you, it compacts the session while the cache is still warm (skipped when the context is under 30k tokens), turns keep-warm off for the session and sends a notification. Any prompt or command from you resets the count.
+- Pings earn no XP and don't count as you coming back.
+- Turn it off everywhere with `--config keepWarm=false` on install, or per session with `/buddy keepwarm off`.
 
 ## What you see
 

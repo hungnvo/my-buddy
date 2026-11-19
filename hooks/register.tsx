@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { BuddyCache, BuddyLimit, BuddyLook, BuddyState, BuddyTask, BuddyUsage, BuddyView } from '../types'
+import type { BuddyAwaiting, BuddyCache, BuddyKeepWarm, BuddyLimit, BuddyLook, BuddyState, BuddyTask, BuddyUsage, BuddyView } from '../types'
 import { EMOJI, LABELS, buddySvg } from './art'
 import type { Src } from './level'
 import {
@@ -18,6 +18,15 @@ const view = atom({ plugin: 'my-buddy', key: 'view' } as const, { main: 'idle', 
 const tasks = atom({ plugin: 'my-buddy', key: 'tasks' } as const, [] as BuddyTask[], { shape: 'tasks-2' })
 
 const usage = atom({ plugin: 'my-buddy', key: 'usage' } as const, null as BuddyUsage | null, { shape: 'usage-2' })
+
+// The per-session keep-warm override (survives a plugin reload; only counts while the session id matches).
+const keepwarm = atom({ plugin: 'my-buddy', key: 'keepwarm' } as const, null as BuddyKeepWarm | null, { shape: 'keepwarm-1' })
+
+// The main turn ended asking the person something (scoped to the session id; survives a reload and a view reset): no pings until they answer.
+const awaiting = atom({ plugin: 'my-buddy', key: 'awaiting' } as const, null as BuddyAwaiting | null, { shape: 'awaiting-1' })
+
+// The session's last person prompt came from an SDK host: nobody to keep the cache warm for (scoped to the session id, survives a reload).
+const sdkhost = atom({ plugin: 'my-buddy', key: 'sdkhost' } as const, null as BuddyAwaiting | null, { shape: 'awaiting-1' })
 
 // Persisted in $.store (survives a fresh process): one `cacheStamp:<session id>` key per conversation holds when its
 // main thread last refreshed its prompt cache and how long one refresh holds it (one key each, so two processes never
@@ -40,6 +49,14 @@ const CACHE_WARN_MS = 60_000
 const CACHE_COARSE_TICK_MS = 60_000
 const CACHE_FINE_MS = 600_000 // the last stretch, redrawn every CACHE_TICK_MS
 const DEFAULT_TTL_MIN = 60
+const PING_LEAD_MS = 180_000 // a ping goes out this long before the cache goes cold
+const PING_LEAD_SHORT_MS = 60_000 // ... or this long on a 5-minute cache
+const PING_DRAFT_RETRY_MS = 15_000 // a draft in the prompt box holds the ping back; look again after this
+const PING_RETRY_MS = 30_000 // a ping that did not enter the session (denied or threw): try again after this, until the cache is cold
+const MAX_PINGS = 5 // in a row with no activity from the person, then compact and stop
+const COMPACT_MIN_TOKENS = 30_000 // below this a compaction is not worth it
+const PING_TEXT = 'Keep-alive ping from my-buddy to keep the prompt cache warm. Reply with just "ok" and do nothing else.'
+const PLUGIN_NAME = 'my-buddy'
 const MAX_SUBS = 8
 const PANE = 'my-buddy'
 const MAIN_PX = 96
@@ -243,13 +260,14 @@ const detailFor = (tool: string, e: unknown): string | undefined => {
 
 type CacheLine = { text: string; tone?: 'yellow' | 'red' }
 
-// Null before any main response; the caller hides it while a main turn runs.
-const cacheLine = (c: BuddyCache | null, now: number): CacheLine | null => {
+// Null before any main response; the caller hides it while a main turn runs. `armed`: keep-warm will ping before it goes cold.
+const cacheLine = (c: BuddyCache | null, now: number, armed = false): CacheLine | null => {
   if (!c) return null
   const left = c.at + c.ttlMs - now
   if (left <= 0) return { text: 'cache cold', tone: 'red' }
   const secs = Math.floor(left / 1000)
-  const text = left >= 600_000 ? `cache ${Math.floor(secs / 60)}m` : `cache ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+  const base = left >= 600_000 ? `cache ${Math.floor(secs / 60)}m` : `cache ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+  const text = armed ? `${base} · warm` : base
   return left < CACHE_WARN_MS ? { text, tone: 'yellow' } : { text }
 }
 
@@ -276,6 +294,15 @@ let limitsEpoch = 0 // bumped on logout: a measure in flight from before it must
 let pruned = false // stale stamps are pruned once per process (a hot reload resets it)
 let mainRunning = false // between the main turn.start and turn.complete: the cache line is hidden
 let askedUser = false // the main turn put a question to the person: it ends in waiting, not done
+let defaultKeepWarm = true // the keepWarm option
+let pingTimer: Timer | null = null // at most one pending keep-alive timer
+let pingGen = 0 // bumped on every arm and cancel: a callback or a firePing of an older generation does nothing
+let lastPingAt = -Infinity // when the last ping was submitted: never another one sooner than PING_RETRY_MS, whatever the path
+let heldStampAt: number | null = null // pinging was given up for the cache of this stamp (a ping turn failed, an Esc): the next new stamp lifts it
+let personEpoch = 0 // bumped whenever the person shows up: a wind-down in flight must not compact under them
+let pingCount = 0 // pings in a row with no activity from the person
+let pingTurn = false // the main turn now running (or about to) is one of our own pings
+let pingStampAt = 0 // the stamp time a ping turn wrote: not a sign the person was here
 const subTimers = new Map<string, Timer>()
 let workedTurn = false // the main turn made a non-housekeeping tool call
 let lastMainEnd = 0 // when this process's main turn last completed
@@ -402,6 +429,7 @@ async function stampCache($: Api, at: number, ttlMs: number) {
   }
   $.ui.invalidate('ui.render')
   await syncCacheTick($)
+  await safe(() => armPing($))
 }
 
 function stopCacheTick() {
@@ -409,6 +437,13 @@ function stopCacheTick() {
   cacheTick?.cancel()
   cacheTick = null
   cachePeriod = 0
+  cancelPing()
+}
+
+function cancelPing() {
+  pingGen++
+  pingTimer?.cancel()
+  pingTimer = null
 }
 
 // /compact and /model start a cold cache under the same session id: hide the line until the next response.
@@ -725,9 +760,200 @@ async function safe(fn: () => Promise<unknown>) {
   }
 }
 
+// ---------------------------------------------------------------- keep-warm
+
+// The person's override for this session wins; else the keepWarm option.
+async function keepWarmOn($: Api): Promise<boolean> {
+  try {
+    const o = await read($, keepwarm)
+    if (o && o.sid === (await $.session.id())) return o.on
+  } catch {
+    // fall through to the option
+  }
+  return defaultKeepWarm
+}
+
+async function setKeepWarm($: Api, on: boolean) {
+  const sid = await $.session.id()
+  await update($, keepwarm, () => ({ sid, on }))
+  pingCount = 0
+  $.ui.invalidate('ui.render')
+  await safe(() => armPing($))
+}
+
+// Who counts as the person: their own gestures (the terminal composer, the Remote Control bridge, a Slack ping, an SDK host's turn)
+// and a command they run. A prompt with no origin is theirs too. Every plugin's prompt (even `asUser`), a task notification,
+// a scheduled trigger, a peer or coordinator delivery, a channel relay and any engine notice are not: they never reset the
+// ping count or the answer the person owes.
+const PERSON_KINDS = new Set(['composer', 'bridge', 'slack-ping', 'sdk'])
+const isPerson = (origin: { kind: string } | undefined) => !origin || PERSON_KINDS.has(origin.kind)
+
+// The person is here: the run of pings starts over, and a question they were asked no longer blocks.
+async function personHere($: Api, origin: { kind: string } | undefined) {
+  await safe(() => setSdkHost($, origin?.kind === 'sdk'))
+  await personBack($)
+}
+
+async function personBack($: Api) {
+  pingCount = 0
+  personEpoch++
+  await safe(() => setAwaiting($, false))
+}
+
+const pingLead = (ttlMs: number) => (ttlMs <= 300_000 ? PING_LEAD_SHORT_MS : PING_LEAD_MS)
+
+// One timer, re-armed whenever the stamp (or the setting) changes: it fires `pingLead` before the cache goes cold.
+// Every arm and cancel bumps `pingGen`, so a timer or a firePing that was already past its checks cannot act on old news.
+async function armPing($: Api) {
+  cancelPing()
+  const gen = pingGen
+  if (!(await keepWarmOn($))) return
+  const c = await currentCache($)
+  if (!c || gen !== pingGen || c.at === heldStampAt) return
+  const now = await $.clock.now()
+  const left = c.at + c.ttlMs - now
+  if (left <= 0 || gen !== pingGen) return
+  pingTimer = $.clock.after(Math.max(0, left - pingLead(c.ttlMs), lastPingAt + PING_RETRY_MS - now), () => {
+    if (gen !== pingGen) return
+    pingTimer = null
+    void safe(() => firePing($, gen))
+  })
+}
+
+// Looks again after `ms` for the same generation (a draft, a ping that did not go out).
+function retryPing($: Api, gen: number, ms: number) {
+  if (gen !== pingGen) return
+  pingTimer = $.clock.after(ms, () => {
+    if (gen !== pingGen) return
+    pingTimer = null
+    void safe(() => firePing($, gen))
+  })
+}
+
+const sdkHostOn = async ($: Api): Promise<boolean> => {
+  try {
+    const a = await read($, sdkhost)
+    return !!a && a.sid === (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
+async function setSdkHost($: Api, on: boolean) {
+  const sid = await $.session.id()
+  await update($, sdkhost, cur => (on ? (cur?.sid === sid ? cur : { sid }) : cur === null ? cur : null))
+}
+
+const awaitingAnswer = async ($: Api): Promise<boolean> => {
+  try {
+    const a = await read($, awaiting)
+    return !!a && a.sid === (await $.session.id())
+  } catch {
+    return false
+  }
+}
+
+async function setAwaiting($: Api, on: boolean) {
+  const sid = await $.session.id()
+  await update($, awaiting, cur => (on ? (cur?.sid === sid ? cur : { sid }) : cur === null ? cur : null))
+}
+
+// Whether a ping can actually go out now (what the ` · warm` marker promises).
+async function pingArmed($: Api): Promise<boolean> {
+  if (!(await keepWarmOn($)) || pingCount >= MAX_PINGS || (await sdkHostOn($))) return false
+  if (await awaitingAnswer($)) return false
+  if (heldStampAt !== null && (await currentCache($))?.at === heldStampAt) return false // on hold until a new stamp
+  return (await read($, view)).main !== 'waiting'
+}
+
+// Pings, or at the cap compacts and switches keep-warm off. Every guard is checked again here: the world moved since arming.
+async function firePing($: Api, gen: number) {
+  if (gen !== pingGen || !(await keepWarmOn($))) return
+  const c = await currentCache($)
+  if (!c || gen !== pingGen) return
+  if (c.at === heldStampAt) return
+  const now = await $.clock.now()
+  const left = c.at + c.ttlMs - now
+  if (left <= 0) return // already cold
+  if (left > pingLead(c.ttlMs) + 1000) return armPing($) // the stamp moved on: not yet
+  if (now - lastPingAt < PING_RETRY_MS) return retryPing($, gen, PING_RETRY_MS - (now - lastPingAt)) // never in a burst
+  if (mainRunning || askedUser || (await sdkHostOn($))) return
+  if (gen !== pingGen) return
+  if (await awaitingAnswer($)) return
+  const v = await read($, view)
+  if (v.main === 'waiting') return
+  // A draft, the demo or a compaction in progress only delay it: look again shortly, while the cache still lasts.
+  const draft = isDemo || v.main === 'compacting' ? { text: 'busy' } : await $.prompt.read().catch(() => ({ text: '' }))
+  if (gen !== pingGen) return
+  if (draft.text.trim()) return retryPing($, gen, PING_DRAFT_RETRY_MS)
+  if (pingCount >= MAX_PINGS) return windDown($)
+  pingCount++
+  pingTurn = true
+  lastPingAt = now
+  // `submit` resolves once the prompt entered the session (its turn started or it was queued), not when the turn ends.
+  let entered = false
+  try {
+    const r = await $.prompt.submit({ text: PING_TEXT })
+    entered = !(r && 'drop' in r && r.drop !== undefined)
+  } catch {
+    entered = false
+  }
+  if (entered || gen !== pingGen) return
+  // It did not enter: undo the bookkeeping (unless a person prompt or a turn has taken over meanwhile) and try again until the cache is cold.
+  if (pingTurn && !mainRunning) {
+    pingTurn = false
+    pingCount = Math.max(0, pingCount - 1)
+    await safe(() => toIdle($))
+  }
+  retryPing($, gen, PING_RETRY_MS)
+}
+
+// After MAX_PINGS: compact while the cache is still warm (a big context only), then stop pinging for this session.
+async function windDown($: Api) {
+  await safe(() => setKeepWarm($, false))
+  const gen = pingGen // any arm or cancel after this means the world moved on
+  const epoch = personEpoch
+  let tokens: number | undefined
+  await safe(async () => {
+    await seedUsage($)
+    tokens = (await read($, usage))?.tokens
+  })
+  // A person prompt or a turn that took over while we looked up the size: no compaction under their feet.
+  const stillAway = async () => !mainRunning && gen === pingGen && epoch === personEpoch && !(await sdkHostOn($)) && !(await awaitingAnswer($))
+  let compacted = false
+  if ((tokens === undefined || tokens >= COMPACT_MIN_TOKENS) && (await stillAway())) {
+    try {
+      const r = await $.session.compact()
+      compacted = !(r && 'skip' in r && r.skip !== undefined)
+    } catch {
+      compacted = false
+    }
+  }
+  const text = compacted
+    ? `Keep-warm stopped after ${MAX_PINGS} pings; compacted the session so the next start is cheap.`
+    : `Keep-warm stopped after ${MAX_PINGS} pings.`
+  await safe(() => $.ui.notify(text, { title: 'Buddy' }))
+}
+
+// What `/buddy keepwarm` answers: the new status, the context size and what a ping costs, in words.
+async function keepWarmReply($: Api): Promise<string> {
+  await safe(() => seedUsage($))
+  const tokens = (await read($, usage).catch(() => null))?.tokens
+  const on = await keepWarmOn($)
+  const head = on
+    ? `Keep-warm is on for this session: a tiny ping goes out about ${Math.round(pingLead((await currentCache($))?.ttlMs ?? DEFAULT_TTL_MIN * 60_000) / 60_000)} min before the cache goes cold, up to ${MAX_PINGS} in a row while you are away, then the session is compacted.`
+    : 'Keep-warm is off for this session.'
+  const cost =
+    tokens === undefined
+      ? 'Context size is not known yet.'
+      : `Context is about ${fmtTokens(tokens)} tokens, so each ping reads ~${fmtTokens(tokens)} cached tokens (a small fraction of the price of a cold restart).`
+  return `${head} ${cost}`
+}
+
 export const register: Register = (on, options) => {
   const minutes = Number(options.cacheTtlMinutes)
   const ttlMs = (Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_TTL_MIN) * 60_000
+  defaultKeepWarm = (options as Record<string, unknown>).keepWarm !== false && (options as Record<string, unknown>).keepWarm !== 'false'
 
 
   on('session.start', async ($, e, next) => {
@@ -739,6 +965,7 @@ export const register: Register = (on, options) => {
     await safe(() => rescueHelpers($))
     await safe(() => seedUsage($))
     await safe(() => syncCacheTick($))
+    await safe(() => armPing($))
     await safe(() => refreshXp($))
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -749,6 +976,12 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   on('prompt.submit', async ($, e, next) => {
+    const isPing = e.origin?.kind === 'plugin' && (e.origin as { name?: string }).name === PLUGIN_NAME
+    if (isPing) pingTurn = true
+    else {
+      if (isPerson(e.origin)) await personHere($, e.origin)
+      if (!mainRunning) pingTurn = false
+    }
     askedUser = false
     if (!mainRunning) workedTurn = false // a prompt queued mid-turn keeps the running turn's work
     await safe(() => pruneSubs($))
@@ -761,14 +994,16 @@ export const register: Register = (on, options) => {
       if (ended.size) await safe(() => dropTasks($, t => ended.has(t.id)))
     }
     // XP work does not hold the prompt back; it is serialized through the award queue and invalidates the UI itself.
-    if (!e.command) {
+    if (!e.command && !isPing) {
       const text = e.text
       void safe(async () => {
         const srcs: Src[] = []
         if (isThanks(text)) srcs.push('thanks')
         const c = await currentCache($)
         const now = await $.clock.now()
-        if (c && now < c.at + c.ttlMs && now - Math.max(c.at, lastMainEnd) >= RETURN_IDLE_MS) srcs.push('back')
+        // "Back" needs the cache to have stayed warm on the person's own activity: a ping's stamp does not count.
+        const personAt = c ? (c.at === pingStampAt ? lastMainEnd : c.at) : 0
+        if (c && personAt > 0 && now < personAt + c.ttlMs && now - Math.max(personAt, lastMainEnd) >= RETURN_IDLE_MS) srcs.push('back')
         if (srcs.length) await earn($, srcs)
         else {
           await refreshXp($)
@@ -842,7 +1077,10 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const t = await $.clock.now()
     const r = yield* next(e)
-    if (!e.agentId && r?.usage) await safe(() => stampCache($, t, ttlMs))
+    if (!e.agentId && r?.usage) {
+      if (pingTurn) pingStampAt = t
+      await safe(() => stampCache($, t, ttlMs))
+    }
     return r
   })
 
@@ -857,20 +1095,35 @@ export const register: Register = (on, options) => {
     } else {
       const asked = askedUser || (e.reason === 'answer' && typeof e.answer === 'string' && e.answer.trim().endsWith('?'))
       askedUser = false
-      lastMainEnd = await $.clock.now()
-      worked = workedTurn
+      const wasPing = pingTurn
+      pingTurn = false
+      const failed = e.reason === 'error' || e.reason === 'refusal'
+      if (e.reason === 'aborted') await personBack($) // Esc: the person is here
+      else if (wasPing && failed) pingCount = Math.max(0, pingCount - 1) // an outage is not a ping that went through
+      if (!wasPing) lastMainEnd = await $.clock.now() // a ping is not the person coming and going
+      worked = workedTurn && !wasPing
       workedTurn = false
       await safe(() => pruneSubs($))
       mainRunning = false
       $.ui.invalidate('ui.render')
       await safe(() => syncCacheTick($))
-      if (asked) await safe(() => setMain($, 'waiting'))
-      else {
+      if (asked) {
+        await safe(() => setAwaiting($, true))
+        await safe(() => setMain($, 'waiting'))
+      } else {
         await safe(() => setMain($, 'done'))
         idleTimer = $.clock.after(DONE_TO_IDLE_MS, () => void toIdle($, true))
       }
       // After the visible state has changed, so the store never holds up "done".
       if (worked) await safe(() => earn($, ['turn', 'firstTurn']))
+      // A turn that ended without a fresh stamp must not make the ping loop on: an Esc, or a failure inside the lead (or of a ping), gives up this cold cycle.
+      let hold = e.reason === 'aborted'
+      if (!hold && failed) {
+        const c = await currentCache($)
+        hold = wasPing || (!!c && c.at + c.ttlMs - (await $.clock.now()) <= pingLead(c.ttlMs) + 1000)
+      }
+      if (hold) heldStampAt = (await currentCache($))?.at ?? null
+      await safe(() => armPing($)) // the guards may have changed (a question asked, a turn over)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -902,11 +1155,19 @@ export const register: Register = (on, options) => {
       // The cache line needs no forgetting: stamps are keyed by session id. But no session.start follows, so once the id
       // has switched, re-sync the tick: the new conversation may hold a warm stamp (a resume) the old tick never drew.
       await safe(() => update($, usage, u => u && { ...u, tokens: undefined, percent: undefined }))
-      $.clock.after(0, () => void safe(() => syncCacheTick($)))
+      // The ping state belongs to the conversation that ended.
+      pingCount = 0
+      pingTurn = false
+      pingStampAt = 0
+      lastPingAt = -Infinity
+      heldStampAt = null
+      cancelPing()
+      $.clock.after(0, () => void safe(async () => { await syncCacheTick($); await armPing($) }))
     }
     if (e.reason === 'logout') {
       limitsEpoch++
       await safe(() => $.store.delete(LIMITS_KEY))
+      cancelPing()
       isBearer = null // re-read lazily: the credential may not be gone yet, and a new login may follow
     }
     return next(e)
@@ -937,7 +1198,17 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'buddy' }, async $ => ({ text: await openAsked($) })).catch(() => ({
+  on('command.run', { command: 'buddy' }, async ($, e) => {
+    const args = (e.args ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+    if (isPerson(e.origin)) await personHere($, e.origin) // the person ran a command
+    if (args.length === 0) return { text: await openAsked($) }
+    if (args[0] !== 'keepwarm' || args.length > 2 || (args[1] !== undefined && args[1] !== 'on' && args[1] !== 'off')) {
+      return { text: 'Usage: /buddy [keepwarm [on|off]]' }
+    }
+    const next = args[1] === undefined ? !(await keepWarmOn($)) : args[1] === 'on'
+    await setKeepWarm($, next)
+    return { text: await keepWarmReply($) }
+  }).catch(() => ({
     text: 'Buddy pane not shown.',
   }))
 
@@ -965,7 +1236,7 @@ export const register: Register = (on, options) => {
     const label = labelOf(v)
     const look = (await xpNow($))?.look
     const bonus = floatText(await $.clock.now())
-    const line = e.props.isWorking || mainRunning ? null : cacheLine(c, await $.clock.now())
+    const line = e.props.isWorking || mainRunning ? null : cacheLine(c, await $.clock.now(), await pingArmed($))
     const inline = line !== null && rows.length < 2 // the terminal never grows a row: it joins the label row
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
@@ -1055,7 +1326,7 @@ export const register: Register = (on, options) => {
     const xpText = xp ? xpLine(xp.total) : ''
     const goldText = xp ? goldenLine(xp.golden) : ''
     const bonus = floatText(await $.clock.now())
-    const line = mainRunning ? null : cacheLine(await currentCache($), await $.clock.now())
+    const line = mainRunning ? null : cacheLine(await currentCache($), await $.clock.now(), await pingArmed($))
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
       return (
