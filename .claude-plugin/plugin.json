@@ -8,12 +8,6 @@
       "title": "Prompt cache TTL (minutes)",
       "description": "How long one API response keeps the prompt cache warm: 60 on the 1-hour tier (the default), 5 on the 5-minute tier.",
       "default": 60
-    },
-    "keepWarm": {
-      "type": "boolean",
-      "title": "Keep the prompt cache warm",
-      "description": "While you are away, send a tiny keep-alive prompt just before the cache goes cold, up to 5 times in a row, then compact the session and stop. Override per session with /buddy keepwarm.",
-      "default": true
     }
   }
 }

@@ -51,19 +51,8 @@ export type BuddyCache = {
   ttlMs: number
 }
 
-/** The person's per-session keep-warm choice, made with `/buddy keepwarm`; ignored once the session id differs */
-export type BuddyKeepWarm = {
-  sid: string
-  on: boolean
-}
-
-/** Set while the main turn's last word was a question to the person; ignored once the session id differs */
-export type BuddyAwaiting = {
-  sid: string
-}
-
 declare module 'claude-code' {
   interface PluginState {
-    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null>; tasks: Shaped<BuddyTask[]>; keepwarm: Shaped<BuddyKeepWarm | null>; awaiting: Shaped<BuddyAwaiting | null>; sdkhost: Shaped<BuddyAwaiting | null> }
+    'my-buddy': { view: Shaped<BuddyView>; usage: Shaped<BuddyUsage | null>; tasks: Shaped<BuddyTask[]> }
   }
 }
