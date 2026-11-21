@@ -8,6 +8,12 @@
       "title": "Prompt cache TTL (minutes)",
       "description": "How long one API response keeps the prompt cache warm: 60 on the 1-hour tier (the default), 5 on the 5-minute tier.",
       "default": 60
+    },
+    "terminalArt": {
+      "type": "boolean",
+      "title": "Pixel Mochi in the terminal",
+      "description": "Draw Mochi as half-block pixel art above the prompt when there is room (needs 24-bit colour). Off keeps the one-line emoji.",
+      "default": true
     }
   }
 }

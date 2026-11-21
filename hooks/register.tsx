@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { BuddyCache, BuddyLimit, BuddyLook, BuddyState, BuddyTask, BuddyUsage, BuddyView } from '../types'
-import { EMOJI, LABELS, buddySvg } from './art'
+import { EMOJI, LABELS, animOf, buddyCells, buddySvg } from './art'
 import type { Src } from './level'
 import {
   award, commitOutput, isCommit, isPrCreate, isTestCmd, isThanks, levelOf, prOutput, refreshXp, xpSummary, freshXp,
@@ -107,6 +107,11 @@ const resetText = (iso: string | undefined, now: number, weekday: boolean) => {
 }
 
 const NARROW_COLUMNS = 60
+const ART_ROWS = 8 // the terminal Mochi is 8 cells tall (2 pixels per cell)
+const ART_MIN_COLUMNS = 70 // meters + a label + the 16-column Mochi need this much room
+const SUB_COLS = 10 // one subagent in the art band: the widest emoji (background, 9 columns) and a space
+const ART_GONE_MS = 1000 // a band unrendered this long is gone: the animation timer stops (renders can lag a tick or two)
+const ART_HOLD_MS = 120_000 // after this long in one state the art holds frame 0 and stops redrawing, until the state changes
 
 type Meter = { label: string; pct: number; tone: Tone; text: string }
 
@@ -276,6 +281,58 @@ let askedUser = false // the main turn put a question to the person: it ends in 
 const subTimers = new Map<string, Timer>()
 let workedTurn = false // the main turn made a non-housekeeping tool call
 let lastMainEnd = 0 // when this process's main turn last completed
+// The terminal Mochi's animation: one timer at the state's frame rate, running only while the band draws art.
+let artTimer: Timer | null = null
+let artState: BuddyState | null = null
+let artFrame = 0
+let artSeen = false // set by every art render; a tick that finds it unset skips (a slow render), it does not advance
+let artSeenAt = 0 // when the band last rendered art
+let artSince = 0 // when the main state last changed
+let artHeld = false // held at frame 0 after ART_HOLD_MS in one state
+
+function stopArt() {
+  artTimer?.cancel()
+  artTimer = null
+  artState = null
+  artFrame = 0
+  artHeld = false
+}
+
+// Synchronous on purpose (callers read the clock first): two renders racing can never leave two timers.
+// Idle holds a still frame, so it has no timer.
+function syncArt($: Api, state: BuddyState, now: number) {
+  artSeen = true
+  artSeenAt = now
+  if (state === 'idle') return stopArt()
+  if (artState !== state) {
+    stopArt()
+    artState = state
+    artSince = now
+  }
+  if (artHeld || artTimer) return
+  const me: Timer = (artTimer = $.clock.every(animOf(state).ms, async () => {
+    const t = await $.clock.now()
+    if (artTimer !== me) return // stopped or replaced while this tick waited for the clock
+    if (t - artSeenAt >= ART_GONE_MS) {
+      // The band is gone: stop, but keep the frame so a later restart continues from it.
+      artTimer.cancel()
+      artTimer = null
+      return
+    }
+    if (t - artSince >= ART_HOLD_MS) {
+      artTimer.cancel()
+      artTimer = null
+      artHeld = true
+      artFrame = 0
+      return void $.ui.invalidate('ui.render')
+    }
+    if (!artSeen) return
+    artSeen = false
+    artFrame++
+    $.ui.invalidate('ui.render')
+  }))
+}
+
 let floater: { n: number; until: number } | null = null
 let floatTimer: Timer | null = null
 const redTests = new Set<string>() // `<session id>|<command>` of test runs that failed and have not passed since
@@ -350,6 +407,7 @@ async function resetLeftovers($: Api) {
   helpersTick?.cancel()
   helpersTick = null
   stopCacheTick()
+  stopArt() // a reload keeps module state but not its timers
   mainRunning = false
   shown = 'idle'
   shownAt = 0
@@ -729,6 +787,7 @@ async function safe(fn: () => Promise<unknown>) {
 
 export const register: Register = (on, options) => {
   const minutes = Number(options.cacheTtlMinutes)
+  const artOn = options.terminalArt !== false && options.terminalArt !== 'false'
   const ttlMs = (Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_TTL_MIN) * 60_000
 
 
@@ -957,18 +1016,65 @@ export const register: Register = (on, options) => {
     const v = await read($, view)
     const u = await read($, usage)
     const c = await currentCache($)
-    if (e.props.hasSurvey) return next(e)
+    const term = e.surface === 'terminal' // only the terminal draws the art, so only it starts or stops the animation
+    if (e.props.hasSurvey) return term && stopArt(), next(e)
     const narrow = (e.props.bodyColumns ?? Infinity) < NARROW_COLUMNS
     let rows = meters(u, await $.clock.now(), narrow)
     if (e.props.maxRows !== undefined && e.props.maxRows < 3) rows = rows.slice(0, Math.max(0, e.props.maxRows))
     // A finished sub alone doesn't keep it up (its drop timer can be lost to a hot reload).
     const busy = v.main !== 'idle' || v.demo || v.subs.some(s => s.state !== 'done')
-    if (rows.length === 0 && !busy) return next(e)
+    if (rows.length === 0 && !busy) return term && stopArt(), next(e)
     const label = labelOf(v)
     const look = (await xpNow($))?.look
     const bonus = floatText(await $.clock.now())
     const line = e.props.isWorking || mainRunning ? null : cacheLine(c, await $.clock.now())
     const inline = line !== null && rows.length < 2 // the terminal never grows a row: it joins the label row
+    const art = term && artOn && (e.props.maxRows ?? Infinity) >= ART_ROWS &&
+      (e.props.bodyColumns ?? Infinity) >= ART_MIN_COLUMNS + SUB_COLS * v.subs.length
+    if (term && !art) stopArt()
+    if (art) {
+      const { Box, Text } = $.ui.resolve(e)
+      syncArt($, v.main, await $.clock.now())
+      const cells = buddyCells(v.main, 0, look, v.main === 'idle' ? 0 : artFrame)
+      return (
+        <Box flexDirection="row" justifyContent="space-between" width="100%">
+          <Box flexDirection="column" flexShrink={0}>
+            {rows.map(m => {
+              const [lit, rest] = blockBar(m.pct)
+              return (
+                <Box key={`meter-${m.label}`} flexDirection="row">
+                  <Text dimColor>{`${m.label.padEnd(3)} `}</Text>
+                  <Text color={m.tone}>{lit}</Text>
+                  <Text dimColor>{rest}</Text>
+                  <Text dimColor wrap="truncate-end">{` ${m.text}`}</Text>
+                </Box>
+              )
+            })}
+          </Box>
+          <Box flexDirection="row" alignItems="flex-end">
+            {v.subs.map(s => (
+              <Text key={`sub-${s.id}`} dimColor>{`${EMOJI[s.state]} `}</Text>
+            ))}
+            <Box flexDirection="column" alignItems="flex-end" marginRight={1}>
+              <Box flexDirection="row">
+                <Text wrap="truncate-end">{label}</Text>
+                {bonus && <Text color="green">{` ${bonus}`}</Text>}
+              </Box>
+              {line && <Text key="cache" dimColor={!line.tone} color={line.tone}>{line.text}</Text>}
+            </Box>
+            <Box key="mochi" flexDirection="column" flexShrink={0}>
+              {cells.map((r, y) => (
+                <Box key={`art-${y}`} flexDirection="row">
+                  {r.map((c, x) => (
+                    <Text key={`c-${x}`} {...(c.fg && { color: c.fg })} {...(c.bg && { backgroundColor: c.bg })}>{c.text}</Text>
+                  ))}
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        </Box>
+      )
+    }
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
       return (

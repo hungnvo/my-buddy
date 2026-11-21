@@ -43,6 +43,8 @@ Then run `/reload-plugins`. On the 5-minute prompt cache, add `--config cacheTtl
 </tr>
 </table>
 
+In the terminal, Mochi is a half-block pixel figure when the band has 8 rows and at least 70 columns (10 more per subagent). It's best with 24-bit colour; 256-colour terminals get approximate colours, and tmux needs `set -as terminal-features ",*:RGB"`. Subagents show as emoji beside it. With less room it falls back to the one-line emoji. Turn the art off with `--config terminalArt=false`.
+
 **Meters** on the left, one row each when there's data:
 
 | Row | Example | Color |

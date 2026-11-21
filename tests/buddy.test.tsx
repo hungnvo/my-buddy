@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { LABELS, buddySvg } from '../hooks/art'
+import { EMOJI, LABELS, animOf, buddyCells, buddySvg } from '../hooks/art'
+import type { CellSpan } from '../hooks/art'
 import { award, freshXp, xpLine, xpSummary } from '../hooks/level'
 
 // ---------------------------------------------------------------- helpers
@@ -3294,3 +3295,648 @@ test('buddy: any arguments still give the XP reply and open no pane', async ($, 
     expect((await buddy($, a)).text).toBe(t)
   expect(c.opened.length).toBe(0)
 })
+
+// ---------------------------------------------------------------- terminal pixel art
+
+const SVG_HASH = '1a6504021cf1c2' // length 16380435, taken before buddyCells was factored out of frameSvg
+const hashOf = (s: string) => {
+  let a = 0xdeadbeef, b = 0x41c6ce57
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    a = Math.imul(a ^ c, 2654435761)
+    b = Math.imul(b ^ c, 1597334677)
+  }
+  a = Math.imul(a ^ (a >>> 16), 2246822507) ^ Math.imul(b ^ (b >>> 13), 3266489909)
+  b = Math.imul(b ^ (b >>> 16), 2246822507) ^ Math.imul(a ^ (a >>> 13), 3266489909)
+  return (4294967296 * (2097151 & b) + (a >>> 0)).toString(16)
+}
+
+test('desktop svg output is unchanged by the cell refactor', async () => {
+  let all = ''
+  for (const st of Object.keys(LABELS))
+    for (let p = 0; p < 5; p++) {
+      all += buddySvg(st as any, p, 64)
+      for (let l = 1; l <= 4; l++) for (let m = 0; m < 12; m++) all += buddySvg(st as any, p, 64, { level: l, month: m })
+    }
+  expect(all.length).toBe(16380435)
+  expect(hashOf(all)).toBe(SVG_HASH)
+})
+
+const flat = (rows: CellSpan[][]) => rows.map(r => r.map(c => c.text).join(''))
+const colors = (rows: CellSpan[][]) => new Set(rows.flatMap(r => r.flatMap(c => [c.fg, c.bg].filter(Boolean) as string[])))
+
+test('idle frame 0 as cells: 8 rows of 16, blank top, outline and fill below', async () => {
+  const rows = buddyCells('idle', 0, undefined, 0)
+  expect(rows.length).toBe(8)
+  expect(flat(rows).every(t => [...t].length === 16)).toBe(true)
+  expect(rows[0]).toEqual([{ text: ' '.repeat(16) }])
+  expect(rows[1]).toEqual([{ text: ' '.repeat(16) }])
+  // y 4/5: head top outline over the first fill row, with the side outline starting at y 5
+  expect(rows[2]).toEqual([
+    { text: '   ' }, { text: '▄', fg: '#3b2a3a' }, { text: '▀'.repeat(8), fg: '#3b2a3a', bg: '#f4a7c0' },
+    { text: '▄', fg: '#3b2a3a' }, { text: '   ' },
+  ])
+  // y 14/15: bottom outline over nothing: top only
+  expect(rows[7]).toEqual([{ text: '    ' }, { text: '▀'.repeat(8), fg: '#3b2a3a' }, { text: '    ' }])
+})
+
+test('cells follow the half-block rules and always fit 16 columns', async () => {
+  for (const st of Object.keys(LABELS) as any[])
+    for (const look of [undefined, { level: 4, month: 7 }, { level: 3, month: 8 }])
+      for (let f = 0; f < 4; f++) {
+        const rows = buddyCells(st, 1, look, f)
+        expect(rows.length).toBe(8)
+        for (const r of rows) {
+          expect([...r.map(c => c.text).join('')].length).toBe(16)
+          r.forEach((c, i) => {
+            expect(c.text).toMatch(/^( +|▀+|▄+)$/)
+            if (c.text[0] === ' ') expect(c.fg === undefined && c.bg === undefined).toBe(true)
+            if (c.text[0] === '▄') expect(c.bg).toBeUndefined()
+            if (c.text[0] !== ' ') expect(c.fg).toBeDefined()
+            const n = r[i + 1]
+            if (n) expect(n.text[0] !== c.text[0] || n.fg !== c.fg || n.bg !== c.bg).toBe(true) // neighbours merged
+          })
+        }
+      }
+})
+
+// The cells and the SVG are drawn from the same pixels: decode both and compare inside the 16x16 grid.
+const svgPixels = (svg: string, frame: number) => {
+  const g = svg.match(new RegExp(`<g class="f f${frame}">(.*?)</g>`))![1]!
+  const px = new Map<string, string>()
+  for (const [, fill, d] of g.matchAll(/fill="(#[0-9a-f]{6})" d="([^"]*)"/g))
+    for (const [, x, y, w] of d!.matchAll(/M(-?\d+) (-?\d+)h(\d+)v1h-\d+z/g))
+      for (let i = 0; i < +w!; i++) if (+x! + i >= 0 && +x! + i < 16 && +y! >= 0 && +y! < 16) px.set(`${+x! + i},${y}`, fill!)
+  return px
+}
+const cellPixels = (rows: CellSpan[][]) => {
+  const px = new Map<string, string>()
+  rows.forEach((r, ry) => {
+    let x = 0
+    for (const c of r)
+      for (const ch of c.text) {
+        if (ch === '▀') {
+          px.set(`${x},${ry * 2}`, c.fg!)
+          if (c.bg) px.set(`${x},${ry * 2 + 1}`, c.bg)
+        } else if (ch === '▄') px.set(`${x},${ry * 2 + 1}`, c.fg!)
+        x++
+      }
+  })
+  return px
+}
+
+test('cells carry exactly the pixels of the svg frame (body, props, bow, hat, gold, sparks)', async () => {
+  for (const st of Object.keys(LABELS) as any[])
+    for (const look of [undefined, { level: 2, month: 0 }, { level: 3, month: 5 }, { level: 4, month: 11 }]) {
+      const svg = buddySvg(st, 0, 16, look)
+      const frames = (svg.match(/class="f f\d+"/g) ?? []).length
+      for (let f = 0; f < frames; f++)
+        expect([...cellPixels(buddyCells(st, 0, look, f))].sort()).toEqual([...svgPixels(svg, f)].sort())
+    }
+})
+
+test('bow, monthly hat, golden body and sparks show up in the cells', async () => {
+  const base = buddyCells('idle', 0, { level: 1, month: 0 }, 0)
+  const bow = buddyCells('idle', 0, { level: 2, month: 0 }, 0)
+  expect(JSON.stringify(bow)).not.toBe(JSON.stringify(base))
+  expect(colors(base).has('#ef476f')).toBe(false)
+  expect(colors(bow).has('#ef476f')).toBe(true)
+  const hat = buddyCells('idle', 0, { level: 3, month: 0 }, 0) // January party hat: blue and yellow on the head
+  expect(colors(hat).has('#6bb5ff')).toBe(true)
+  expect(flat(hat)[0]).not.toBe(' '.repeat(16))
+  expect(buddyCells('idle', 0, { level: 3, month: 5 }, 0)).not.toEqual(hat) // another month, another hat
+  const gold = buddyCells('working', 0, { level: 4, month: 0 }, 0)
+  expect(colors(gold).has('#ffd54a')).toBe(true)
+  expect(colors(gold).has('#f4a7c0')).toBe(false)
+  const sparkRows = (f: number) => flat(buddyCells('working', 0, { level: 4, month: 0 }, f).slice(0, 2))
+  expect(colors(buddyCells('working', 0, { level: 4, month: 0 }, 0)).has('#ff9f1c')).toBe(true)
+  expect(colors(buddyCells('working', 0, { level: 3, month: 0 }, 0)).has('#ff9f1c')).toBe(false)
+  expect(sparkRows(0)).not.toEqual(sparkRows(1)) // the sparkle follows the frame index
+  expect(colors(buddyCells('reading', 0, undefined, 0)).has('#3d85d8')).toBe(true) // props: the book
+})
+
+test('buddyCells caches frames and wraps the frame index', async () => {
+  expect(buddyCells('editing', 0, undefined, 1)).toBe(buddyCells('editing', 0, undefined, 1))
+  expect(buddyCells('editing', 0, undefined, 5)).toBe(buddyCells('editing', 0, undefined, 1))
+  expect(buddyCells('editing', 0, undefined, 0)).not.toBe(buddyCells('editing', 0, undefined, 1))
+})
+
+// The art rows of a drawn tree (keys art-N), as a count and as an identity of what is on screen.
+const artNodes = (tree: any) => findAll(tree, n => typeof n.props?.key === 'string' && /^art-\d+$/.test(n.props.key))
+const artRows = (tree: any) => artNodes(tree).length
+const artKey = (tree: any) => JSON.stringify(artNodes(tree))
+const artText = (tree: any) => /[▀▄]/.test(JSON.stringify(tree))
+const ART = { maxRows: 8, bodyColumns: 100 }
+const termBand = ($: any, props: Record<string, unknown> = {}) => bandWith($, { ...ART, ...props }, 'terminal')
+const EDIT = { tool: 'Edit', file_path: '/x/register.ts' } as any
+
+test('terminal band draws 8 art rows when there is room, with the label left of the Mochi', async ($, on) => {
+  turnMocks(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const ui = await termBand($)
+  const tree = await ui.drawn()
+  const out = JSON.stringify(tree)
+  expect(artRows(tree)).toBe(8)
+  expect(out).toContain('backgroundColor')
+  expect(out).toMatch(/editing register\.ts/)
+  expect(out).not.toContain('(o.o)#') // no emoji beside the art
+  expect(out).toMatch(/5h/)
+  expect(out.indexOf('editing register.ts')).toBeLessThan(out.indexOf('art-0'))
+  expect(count(out)).toBe(0)
+  await ui.unmount()
+})
+
+test('terminal band falls back to the emoji line when short, narrow or terminalArt is off', async ($, on) => {
+  turnMocks(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  for (const props of [{ maxRows: 7 }, { maxRows: 4 }, { bodyColumns: 69 }, { bodyColumns: 40 }]) {
+    const ui = await termBand($, props)
+    const tree = await ui.drawn()
+    expect(artRows(tree)).toBe(0)
+    expect(artText(tree)).toBe(false)
+    expect(JSON.stringify(tree)).toContain('(o.o)# editing register.ts')
+    await ui.unmount()
+  }
+  const ui = await termBand($, { maxRows: 8, bodyColumns: 70 }) // exactly enough
+  expect(artRows(await ui.drawn())).toBe(8)
+  await ui.unmount()
+})
+
+test('terminalArt=false keeps the emoji line even with room', { options: { terminalArt: false } }, async ($, on) => {
+  turnMocks(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const ui = await termBand($)
+  const tree = await ui.drawn()
+  expect(artRows(tree)).toBe(0)
+  expect(JSON.stringify(tree)).toContain('(o.o)# editing register.ts')
+  await ui.unmount()
+})
+
+test('the desktop band is untouched by terminal art', async ($, on) => {
+  turnMocks(on)
+  await boot($, on)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const ui = await bandWith($, ART, 'desktop')
+  const tree = await ui.drawn()
+  expect(artRows(tree)).toBe(0)
+  expect(count(JSON.stringify(tree))).toBeGreaterThan(0)
+  await ui.unmount()
+})
+
+test('the cache line sits in the label column on the art band', async ($, on) => {
+  stepMocks(on)
+  await boot($, on, { result: {} }, 'terminal')
+  await reply($)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }, { kind: 'seven_day', percentUsed: 10 }], { tokens: 1000, window: 200_000 })
+  const ui = await termBand($)
+  const out = JSON.stringify(await ui.drawn())
+  expect(out).toContain('cache 60m')
+  expect(out.indexOf('cache 60m')).toBeLessThan(out.indexOf('art-0'))
+  await ui.unmount()
+})
+
+const countInvalidates = (on: any) => {
+  const n = { current: 0 }
+  on('ui.invalidate', (_: any, e: any, next: any) => {
+    n.current++
+    return next(e)
+  })
+  return n
+}
+const busyEditing = async ($: any, on: any) => {
+  turnMocks(on)
+  const invalidated = countInvalidates(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  return { clock, ticks: () => invalidated.current }
+}
+
+test('terminal art advances frames on the clock for a busy state', async ($, on) => {
+  const { clock } = await busyEditing($, on)
+  const ui = await termBand($)
+  const seen: string[] = [artKey(await ui.drawn())]
+  for (let i = 0; i < 4; i++) {
+    await clock.advance(140) // editing steps every 140 ms
+    seen.push(artKey(await ui.drawn()))
+  }
+  expect(seen[1]).not.toBe(seen[0])
+  expect(seen[2]).toBe(seen[0]) // editing alternates left/right hands
+  expect(seen[3]).toBe(seen[1])
+  expect(seen[4]).toBe(seen[0])
+  await ui.unmount()
+})
+
+test('terminal art holds frame 0 and runs no timer while idle', async ($, on) => {
+  turnMocks(on)
+  const invalidated = countInvalidates(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const ui = await termBand($)
+  const first = await ui.drawn()
+  expect(artRows(first)).toBe(8)
+  const n = invalidated.current
+  await clock.advance(5000)
+  expect(invalidated.current).toBe(n)
+  expect(artKey(await ui.drawn())).toBe(artKey(first))
+  await ui.unmount()
+})
+
+test('a state change restarts the terminal art timer; rapid changes leave only one', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  for (const tool of ['Read', 'Grep', 'Edit', 'Read', 'Edit']) {
+    await $.tool.call({ tool, file_path: '/x/a.ts', pattern: 'x' } as any)
+    await clock.advance(800)
+    await ui.drawn()
+  }
+  const before = ticks()
+  await clock.advance(140 * 10)
+  const n = ticks() - before
+  expect(n).toBeGreaterThanOrEqual(10)
+  expect(n).toBeLessThanOrEqual(12) // one 140 ms timer (plus the odd state redraw), not several
+  await ui.unmount()
+})
+
+test('the terminal art timer stops when the band falls back to the emoji', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await clock.advance(140)
+  expect(ticks()).toBeGreaterThan(0)
+  await ui.unmount()
+  const short = await termBand($, { maxRows: 4 }) // a render that draws no art stops it
+  await short.drawn()
+  const n = ticks()
+  await clock.advance(2000)
+  expect(ticks()).toBe(n)
+  await short.unmount()
+})
+
+test('the terminal art timer stops once the band is gone', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await ui.unmount()
+  await clock.advance(1500) // a band unrendered for a second is gone: the timer stops
+  const n = ticks()
+  await clock.advance(3000)
+  expect(ticks()).toBe(n)
+})
+
+// ---------------------------------------------------------------- terminal art: timer lifecycle and gating (gap hunt)
+
+test('art band keeps subagents as emoji and the 8 rows', async ($, on) => {
+  turnMocks(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await subStart($, 'sa1')
+  await $.tool.call(sub('sa1', 'Read'))
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const ui = await termBand($)
+  const tree = await ui.drawn()
+  expect(artRows(tree)).toBe(8)
+  expect(JSON.stringify(tree)).toContain(EMOJI.reading)
+  await ui.unmount()
+})
+
+test('a survey stops the art timer and art animation resumes after it', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await clock.advance(140)
+  expect(ticks()).toBeGreaterThan(0)
+  const sv = await termBand($, { hasSurvey: true })
+  await sv.drawn()
+  const n = ticks()
+  await clock.advance(2000)
+  expect(ticks()).toBe(n)
+  await sv.unmount()
+  await ui.unmount()
+  const back = await termBand($)
+  await back.drawn()
+  await clock.advance(140 * 4)
+  expect(ticks()).toBeGreaterThan(n)
+  await back.unmount()
+})
+
+test('art timer restarts after a size fallback when art comes back', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const small = await termBand($, { maxRows: 4 })
+  await small.drawn()
+  await small.unmount()
+  const n0 = ticks()
+  await clock.advance(1000)
+  expect(ticks()).toBe(n0)
+  const ui = await termBand($)
+  await ui.drawn()
+  await clock.advance(140 * 5)
+  expect(ticks() - n0).toBeGreaterThanOrEqual(5)
+  await ui.unmount()
+})
+
+test('the art timer runs at the new state speed after a state change', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await $.tool.call({ tool: 'Read', file_path: '/x/a.ts' } as any)
+  await clock.advance(800)
+  await ui.drawn()
+  const ms = animOf('reading').ms
+  expect(ms).not.toBe(140)
+  const before = ticks()
+  await clock.advance(ms * 10)
+  const n = ticks() - before
+  expect(n).toBeGreaterThanOrEqual(10)
+  expect(n).toBeLessThanOrEqual(11)
+  await ui.unmount()
+})
+
+test('concurrent renders leave one art timer', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const uis = await Promise.all([termBand($), termBand($), termBand($)])
+  await Promise.all(uis.map(u => u.drawn()))
+  const before = ticks()
+  await clock.advance(140 * 10)
+  expect(ticks() - before).toBeLessThanOrEqual(12)
+  for (const u of uis) await u.unmount()
+})
+
+test('a desktop render in the same session does not stop the terminal art animation', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  const d = await bandWith($, ART, 'desktop')
+  await d.drawn()
+  const before = ticks()
+  await clock.advance(140 * 5)
+  expect(ticks() - before).toBeGreaterThanOrEqual(4)
+  await d.unmount()
+  await ui.unmount()
+})
+
+test('the art timer stops once everything is idle and nothing is left to show', async ($, on) => {
+  turnMocks(on)
+  const invalidated = countInvalidates(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  const ui = await termBand($)
+  await ui.drawn()
+  await clock.advance(140)
+  expect(invalidated.current).toBeGreaterThan(0)
+  await $.turn.complete(done())
+  await clock.advance(60_000)
+  await ui.drawn()
+  await clock.advance(1000)
+  const n = invalidated.current
+  await clock.advance(5000)
+  expect(invalidated.current).toBe(n)
+  await ui.unmount()
+})
+
+test('terminal art through /buddy-demo animates and leaves no timer after it ends', async ($, on) => {
+  turnMocks(on)
+  const invalidated = countInvalidates(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await run($, 'buddy-demo')
+  const ui = await termBand($)
+  for (let i = 0; i < 13; i++) {
+    expect(artRows(await ui.drawn())).toBe(8)
+    await clock.advance(2500)
+  }
+  await ui.drawn()
+  await ui.unmount()
+  await clock.advance(5000)
+  const n = invalidated.current
+  await clock.advance(10_000)
+  expect(invalidated.current).toBe(n)
+})
+
+test('a second session.start (hot reload) does not double the art timer', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await ui.drawn()
+  const before = ticks()
+  await clock.advance(140 * 10)
+  expect(ticks() - before).toBeLessThanOrEqual(13)
+  await ui.unmount()
+})
+
+test('slow renders do not freeze the art: missed ticks are skipped and frames still advance with one timer', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const keys: string[] = []
+  const t0 = ticks()
+  for (let i = 0; i < 6; i++) {
+    const ui = await termBand($) // a render lands only every ~300 ms: two ticks per render
+    keys.push(artKey(await ui.drawn()))
+    await ui.unmount()
+    await clock.advance(300)
+  }
+  for (let i = 1; i < keys.length; i++) expect(keys[i]).not.toBe(keys[i - 1]) // each render sees a newer frame
+  const n = ticks() - t0
+  expect(n).toBeGreaterThanOrEqual(5)
+  expect(n).toBeLessThanOrEqual(8) // one invalidate per seen render, not one per tick
+  // the timer is still alive: a render now still gets animation ticks
+  const ui = await termBand($)
+  await ui.drawn()
+  const before = ticks()
+  await clock.advance(140 * 5)
+  expect(ticks() - before).toBeGreaterThanOrEqual(4)
+  await ui.unmount()
+})
+
+test('a band that went away keeps its frame: a later restart continues from it', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const first = await termBand($)
+  const k0 = artKey(await first.drawn())
+  await first.unmount()
+  await clock.advance(140) // one tick advances to frame 1
+  await clock.advance(1500) // then the band is gone and the timer stops
+  const n = ticks()
+  await clock.advance(3000)
+  expect(ticks()).toBe(n)
+  const again = await termBand($)
+  const k1 = artKey(await again.drawn())
+  expect(k1).not.toBe(k0) // not reset to frame 0
+  await clock.advance(140)
+  expect(artKey(await again.drawn())).toBe(k0) // editing alternates: frame 2 looks like frame 0
+  await again.unmount()
+})
+
+test('after two minutes in one state the art holds frame 0 and stops redrawing; a state change animates again', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  const k0 = artKey(await ui.drawn())
+  await clock.advance(140)
+  expect(artKey(await ui.drawn())).not.toBe(k0)
+  await clock.advance(121_000)
+  const held = artKey(await ui.drawn())
+  expect(held).toBe(k0)
+  const n = ticks()
+  await clock.advance(30_000)
+  expect(ticks()).toBe(n)
+  expect(artKey(await ui.drawn())).toBe(k0)
+  await $.tool.call({ tool: 'Read', file_path: '/x/a.ts' } as any)
+  await clock.advance(800)
+  await ui.drawn()
+  const m = ticks()
+  await clock.advance(animOf('reading').ms * 5)
+  expect(ticks() - m).toBeGreaterThanOrEqual(4)
+  await ui.unmount()
+})
+
+test('art needs room for the subagents too: 70 columns plus 10 per sub', async ($, on) => {
+  turnMocks(on)
+  const clock = await boot($, on, { result: {} }, 'terminal')
+  await clock.advance(800)
+  await $.tool.call(EDIT)
+  await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+  const at = async (bodyColumns: number) => {
+    const ui = await termBand($, { bodyColumns })
+    const rows = artRows(await ui.drawn())
+    await ui.unmount()
+    return rows
+  }
+  expect(await at(70)).toBe(8)
+  await subStart($, 'sa1')
+  await $.tool.call(sub('sa1', 'Read'))
+  expect(await at(79)).toBe(0)
+  expect(await at(80)).toBe(8)
+  await subStart($, 'sa2')
+  await $.tool.call(sub('sa2', 'Read'))
+  expect(await at(89)).toBe(0)
+  expect(await at(90)).toBe(8)
+})
+
+test('hold window: just under two minutes still animates; returning to a state after another starts a fresh window', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const ui = await termBand($)
+  await ui.drawn()
+  await clock.advance(119_000)
+  await ui.drawn()
+  const n = ticks()
+  await clock.advance(140 * 3)
+  expect(ticks() - n).toBeGreaterThanOrEqual(2) // still animating at 119 s
+  await $.tool.call({ tool: 'Read', file_path: '/x/a.ts' } as any)
+  await clock.advance(800)
+  await ui.drawn()
+  await $.tool.call(EDIT) // back to editing: its two minutes start here, not at the first edit
+  await clock.advance(800)
+  await ui.drawn()
+  await clock.advance(100_000) // 100 s after the return, 220 s after the first edit
+  await ui.drawn()
+  const m = ticks()
+  await clock.advance(140 * 3)
+  expect(ticks() - m).toBeGreaterThanOrEqual(2)
+  await clock.advance(30_000) // now past the fresh window
+  await ui.drawn()
+  const h = ticks()
+  await clock.advance(10_000)
+  expect(ticks()).toBe(h)
+  await ui.unmount()
+})
+
+test('subagents appearing and leaving mid-animation switch layouts and stop and restart the timer', async ($, on) => {
+  const { clock, ticks } = await busyEditing($, on)
+  const props = { bodyColumns: 85 }
+  let ui = await termBand($, props)
+  expect(artRows(await ui.drawn())).toBe(8)
+  await clock.advance(140)
+  await ui.drawn()
+  await subStart($, 'sa1')
+  await $.tool.call(sub('sa1', 'Read'))
+  await subStart($, 'sa2')
+  await $.tool.call(sub('sa2', 'Read'))
+  await clock.advance(800)
+  expect(artRows(await ui.drawn())).toBe(0) // 85 < 70 + 20: emoji layout
+  await clock.advance(1000) // let any pending tick act on the stop
+  const n = ticks()
+  await clock.advance(5000)
+  expect(ticks()).toBe(n) // no timer while on the emoji layout
+  await $.turn.complete(done('sa1', 'sa1'))
+  await $.turn.complete(done('sa2', 'sa2'))
+  await clock.advance(10_000) // subs drop
+  expect(artRows(await ui.drawn())).toBe(8)
+  const m = ticks()
+  await clock.advance(140 * 6)
+  expect(ticks() - m).toBeGreaterThanOrEqual(4) // animating again
+  await ui.unmount()
+})
+
+// An `on` whose clock.now can be held open, to land a stop while a tick's callback is mid-flight.
+const gatedOn = (on: any) => {
+  const g: { release: (() => void) | null; hold: boolean; waiting: number } = { release: null, hold: false, waiting: 0 }
+  const gated = (name: string, handler: any, ...rest: any[]) =>
+    name !== 'clock.now'
+      ? on(name, handler, ...rest)
+      : on(
+          name,
+          async (a: any, e: any, ...r: any[]) => {
+            if (g.hold) {
+              g.hold = false // only the tick's call parks; renders during the stop must go through
+              g.waiting++
+              await new Promise<void>(res => {
+                const prev = g.release
+                g.release = () => (prev?.(), res())
+              })
+            }
+            return handler(a, e, ...r)
+          },
+          ...rest,
+        )
+  return { g, gated }
+}
+
+for (const name of ['a state change', 'a size fallback', 'a survey']) {
+  test(`a stop from ${name} landing while a tick is mid-flight leaves exactly one live timer`, async ($, on) => {
+    const { g, gated } = gatedOn(on)
+    turnMocks(on)
+    const invalidated = countInvalidates(on)
+    const clock = await boot($, gated, { result: {} }, 'terminal')
+    await clock.advance(800)
+    await $.tool.call(EDIT)
+    await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }])
+    const ticks = () => invalidated.current
+    const ui = await termBand($)
+    await ui.drawn()
+    g.hold = true
+    const advancing = clock.advance(140) // the tick fires and parks on clock.now
+    for (let i = 0; i < 50 && g.waiting === 0; i++) await new Promise(r => setTimeout(r, 1))
+    expect(g.waiting).toBe(1)
+    // the stop lands while the tick is parked
+    const stopProps = name === 'a size fallback' ? { bodyColumns: 50 } : name === 'a survey' ? { hasSurvey: true } : {}
+    if (name === 'a state change') await $.tool.call({ tool: 'Read', file_path: '/x/a.ts' } as any)
+    const stopped = await termBand($, stopProps)
+    await stopped.drawn()
+    // art is drawn again (a new timer), then the parked tick resumes
+    const art = await termBand($)
+    await art.drawn()
+    g.release?.()
+    await advancing
+    await clock.advance(10)
+    await art.drawn()
+    const per = animOf(name === 'a state change' ? 'reading' : 'editing').ms
+    const n = ticks()
+    await clock.advance(per * 10)
+    const got = ticks() - n
+    expect(got).toBeGreaterThanOrEqual(8) // the replacement timer survived the stale tick
+    expect(got).toBeLessThanOrEqual(11) // a second timer would double it
+    await stopped.unmount()
+    await art.unmount()
+    await ui.unmount()
+  })
+}

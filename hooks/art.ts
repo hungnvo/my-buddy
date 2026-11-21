@@ -246,7 +246,8 @@ const accessories = (look: BuddyLook, f: Frame): Px[] => {
   return out
 }
 
-const frameSvg = (p: Palette, f: Frame, look?: BuddyLook, i = 0): string => {
+// The coloured pixels of one frame, keyed "x,y" (the SVG and the terminal cells both draw from this).
+const frameGrid = (p: Palette, f: Frame, look?: BuddyLook, i = 0): Map<string, string> => {
   const col = (ch: string) => ch === 'p' ? p.body : ch === 'h' ? p.hi : ch === 'c' ? p.cheek : ch === 's' ? p.body : (C[ch] ?? '#000')
   const dx = f.dx ?? 0, dy = f.dy ?? 0
   const body = bodyPx(p, f).map(([x, y, c]): Px => [x + dx, y + dy, c])
@@ -255,6 +256,14 @@ const frameSvg = (p: Palette, f: Frame, look?: BuddyLook, i = 0): string => {
   for (const [x, y, c] of [...sparks, ...body, ...(look ? accessories(look, f) : []), ...(f.props ?? [])]) {
     if (x >= -4 && x < 20 && y >= -4 && y < 20) grid.set(`${x},${y}`, col(c))
   }
+  return grid
+}
+
+const paletteOf = (palette: number, look?: BuddyLook): Palette =>
+  look && look.level >= 4 ? GOLD : PALETTES[palette % PALETTES.length]!
+
+const frameSvg = (p: Palette, f: Frame, look?: BuddyLook, i = 0): string => {
+  const grid = frameGrid(p, f, look, i)
   // merge horizontal runs, one <path> per colour
   const byColour = new Map<string, string[]>()
   const ys = [...new Set([...grid.keys()].map(k => +k.split(',')[1]!))].sort((a, b) => a - b)
@@ -276,7 +285,7 @@ const frameSvg = (p: Palette, f: Frame, look?: BuddyLook, i = 0): string => {
 
 /** The whole SVG document for one buddy in one state. Frames are toggled with CSS steps. */
 export const buddySvg = (state: BuddyState, palette: number, px: number, look?: BuddyLook): string => {
-  const p = look && look.level >= 4 ? GOLD : PALETTES[palette % PALETTES.length]!
+  const p = paletteOf(palette, look)
   const { ms, frames } = ANIMS[state]
   const n = frames.length
   const period = (ms * n) / 1000
@@ -289,4 +298,47 @@ export const buddySvg = (state: BuddyState, palette: number, px: number, look?: 
     return `<g class="f f${i}">${frameSvg(p, f, look, i)}</g>`
   }).join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="${px}" height="${px}" shape-rendering="crispEdges" style="background:transparent"><style>${css}</style>${groups}</svg>`
+}
+
+/** How the state's animation steps: milliseconds per frame and the number of frames. */
+export const animOf = (state: BuddyState): { ms: number; frames: number } => {
+  const { ms, frames } = ANIMS[state]
+  return { ms, frames: frames.length }
+}
+
+/** One run of terminal cells sharing colours: `fg` is the foreground, `bg` the background (either may be absent). */
+export type CellSpan = { text: string; fg?: string; bg?: string }
+
+const GRID = 16
+const cellCache = new Map<string, CellSpan[][]>()
+
+/**
+ * One frame as terminal cells: the 16x16 pixel grid cropped, two pixels per cell (8 rows x 16 columns). A cell is
+ * `▀` (top = foreground, bottom = background), `▄` with only the bottom set, a space with neither; neighbours with the
+ * same colours merge into one span. Pure, so frames are cached.
+ */
+export const buddyCells = (state: BuddyState, palette: number, look: BuddyLook | undefined, frame = 0): CellSpan[][] => {
+  const { frames } = ANIMS[state]
+  const i = ((frame % frames.length) + frames.length) % frames.length
+  const key = `${state}|${palette % PALETTES.length}|${look?.level ?? 0}|${look?.month ?? 0}|${i}`
+  const hit = cellCache.get(key)
+  if (hit) return hit
+  const grid = frameGrid(paletteOf(palette, look), frames[i]!, look, i)
+  const rows: CellSpan[][] = []
+  for (let y = 0; y < GRID; y += 2) {
+    const spans: CellSpan[] = []
+    for (let x = 0; x < GRID; x++) {
+      const top = grid.get(`${x},${y}`), bot = grid.get(`${x},${y + 1}`)
+      const cell: CellSpan = top && bot ? { text: '▀', fg: top, bg: bot }
+        : top ? { text: '▀', fg: top }
+        : bot ? { text: '▄', fg: bot }
+        : { text: ' ' }
+      const last = spans[spans.length - 1]
+      if (last && last.fg === cell.fg && last.bg === cell.bg && last.text[0] === cell.text) last.text += cell.text
+      else spans.push(cell)
+    }
+    rows.push(spans)
+  }
+  cellCache.set(key, rows)
+  return rows
 }
