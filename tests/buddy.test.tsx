@@ -3149,6 +3149,216 @@ test('background: a task stored without a deadline gets the 8 hour net', async (
   expect(count(await bandOut($))).toBe(0)
 })
 
+// ---- background tasks: a stopped subagent takes its own shells with it
+
+const subsDone = async ($: any, c: any, ...ids: string[]) => {
+  for (const id of ids) await $.turn.complete(done(id))
+  await c.clock.advance(6000)
+}
+const trackTasks = (on: any) => {
+  let last: any[] = []
+  let writes = 0
+  on('state.set', { plugin: 'my-buddy', key: 'tasks' } as any, async (_: any, e: any, next: any) => {
+    writes++
+    last = e.value?.value ?? e.value ?? []
+    return next(e)
+  })
+  // A positive case reads the stored tasks, so it must have seen at least one write: an event-shape change
+  // cannot turn "drops everything" into a vacuous pass.
+  const read = () => last.map(t => `${t.id}:${t.agentId ?? '-'}`).sort()
+  return Object.assign(() => (expect(writes).toBeGreaterThan(0), read()), { writes: () => writes })
+}
+const agentList = (on: any, list: any[]) => on('agent.list', () => ({ value: list }) as any)
+
+test('background: a subagent shell (run_in_background or auto-moved) is stored with its agentId, main and old ones without', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s1', 'Bash', { command: 'sleep 999' }), { backgroundTaskId: 'b2', backgroundedByUser: false })
+  await c.start(NPM, { backgroundTaskId: 'bm' })
+  expect(stored()).toEqual(['b1:s1', 'b2:s1', 'bm:-'])
+})
+
+test("background: TaskStop on a subagent id drops that subagent's shells and the band returns to idle", async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s1', 'Bash', { command: 'sleep 999' }), { backgroundTaskId: 'b2' })
+  await subsDone($, c, 's1')
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  const out = await bandOut($)
+  expect(count(out)).toBe(0)
+  expect(stored()).toEqual([])
+})
+
+test("background: TaskStop on a subagent leaves other agents' and main's tasks alone", async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s2', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await c.start(NPM, { backgroundTaskId: 'bm' })
+  await subsDone($, c, 's1', 's2')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b2:s2', 'bm:-'])
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+})
+
+test("background: a denied TaskStop on a subagent id drops none of its shells", async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await subsDone($, c, 's1')
+  await c.endTurn()
+  Object.keys(c.res).forEach(k => delete (c.res as any)[k])
+  Object.assign(c.res, { deny: 'blocked by policy' })
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b1:s1'])
+})
+
+test('background: TaskStop on a shell id still drops just that shell, and a task stored without agentId is unaffected by a subagent stop', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(NPM, { backgroundTaskId: 'bm' })
+  await subsDone($, c, 's1')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 'b1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['bm:-'])
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['bm:-'])
+  hasLabel(await bandOut($), `${LABELS.background} npm`)
+})
+
+test('background: TaskStop by legacy shell_id on a subagent id takes its shell and its monitor, and a late notification is harmless', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s1', 'Monitor', { description: 'watch' }), { taskId: 'm1' })
+  await subsDone($, c, 's1')
+  await c.endTurn()
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+  await $.tool.call({ tool: 'TaskStop', shell_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual([])
+  expect(count(await bandOut($))).toBe(0)
+  await afterNote($, c.clock, note('b1', 'killed')) // the notification for the dead shell: no error, no resurrection
+  expect(stored()).toEqual([])
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: TaskStop issued by another subagent works, and a second stop of the same agent is harmless', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s3', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b3' })
+  await subsDone($, c, 's1', 's3')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1', agentId: 's2' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b3:s3'])
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b3:s3'])
+  hasLabel(await bandOut($), `${LABELS.background} tail`)
+})
+
+// Nested subagents: a child agent is stopped with its parent (AgentInfo.parentId), so its shells go too.
+test("background: stopping a parent subagent drops a nested subagent's shell too, and not an unrelated agent's", async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [
+    { id: 'parent' },
+    { id: 'child', parentId: 'parent' },
+    { id: 'grandchild', parentId: 'child' },
+    { id: 'other' },
+  ])
+  const c = await bgBoot($, on)
+  await c.start(sub('parent', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'bp' })
+  await c.start(sub('child', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'bc' })
+  await c.start(sub('grandchild', 'Monitor', { description: 'deep' }), { taskId: 'bg' })
+  await c.start(sub('other', 'Bash', { command: 'sleep 999', run_in_background: true }), { backgroundTaskId: 'bo' })
+  await subsDone($, c, 'parent', 'child', 'grandchild', 'other')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 'parent' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['bo:other'])
+})
+
+test('background: a parentId cycle in the agent list does not hang the stop', async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 'a', parentId: 'b' }, { id: 'b', parentId: 'a' }])
+  const c = await bgBoot($, on)
+  await c.start(sub('a', 'Bash', { command: 'x', run_in_background: true }), { backgroundTaskId: 'ba' })
+  await c.start(sub('b', 'Bash', { command: 'y', run_in_background: true }), { backgroundTaskId: 'bb' })
+  await subsDone($, c, 'a', 'b')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 'a' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual([])
+})
+
+test('background: a failing agent.list falls back to dropping just the stopped agent', async ($, on) => {
+  const stored = trackTasks(on)
+  on('agent.list', () => {
+    throw new Error('boom')
+  })
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s2', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await subsDone($, c, 's1', 's2')
+  await c.endTurn()
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b2:s2'])
+})
+
+test("background: TaskStop by a name drops the agent's tasks, via the result's task_id", async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s2', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await subsDone($, c, 's1', 's2')
+  await c.endTurn()
+  c.res.result = { message: 'stopped', task_id: 's1', task_type: 'local_agent' }
+  await $.tool.call({ tool: 'TaskStop', task_id: 'researcher' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b2:s2'])
+})
+
+test("background: TaskStop by a name with no task_id in the result resolves through agent.list", async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 's1', name: 'researcher' }, { id: 's2', name: 'writer' }])
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s2', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await subsDone($, c, 's1', 's2')
+  await c.endTurn()
+  c.res.result = {}
+  await $.tool.call({ tool: 'TaskStop', task_id: 'researcher' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b2:s2'])
+})
+
+test('background: a Monitor started by a subagent is dropped by TaskStop on that subagent via task_id', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await c.start(sub('s1', 'Monitor', { description: 'watch' }), { taskId: 'm1' })
+  await c.start(NPM, { backgroundTaskId: 'bm' })
+  await subsDone($, c, 's1')
+  await c.endTurn()
+  expect(stored()).toEqual(['bm:-', 'm1:s1'])
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['bm:-'])
+})
+
 // ---- background tasks: gap tests for the review-fix round
 
 const TASK_NOTE = (inner: string) => `<task-notification>${inner}</task-notification>`
@@ -3940,3 +4150,80 @@ for (const name of ['a state change', 'a size fallback', 'a survey']) {
     await ui.unmount()
   })
 }
+
+// ---- background tasks: TaskStop ambiguity and result passthrough (tester round)
+
+const seedTwo = async ($: any, c: any) => {
+  await c.start(sub('s1', 'Bash', { command: 'npm start', run_in_background: true }), { backgroundTaskId: 'b1' })
+  await c.start(sub('s2', 'Bash', { command: 'tail -f x', run_in_background: true }), { backgroundTaskId: 'b2' })
+  await subsDone($, c, 's1', 's2')
+  await c.endTurn()
+}
+
+test('background: two agents sharing a name: the id in the result decides, the other keeps its tasks', async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 's1', name: 'worker' }, { id: 's2', name: 'worker' }])
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  c.res.result = { message: 'stopped', task_id: 's2' }
+  await $.tool.call({ tool: 'TaskStop', task_id: 'worker' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b1:s1'])
+})
+
+test("background: a name equal to another agent's id is that id, not the namesake", async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 's1', name: 'x' }, { id: 's2', name: 's1' }])
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  c.res.result = {}
+  await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b2:s2'])
+})
+
+test('background: a name with no matching agent and no result id removes nothing', async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 's1', name: 'researcher' }, { id: 's2', name: 'writer' }])
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  c.res.result = {}
+  await $.tool.call({ tool: 'TaskStop', task_id: 'ghost' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual(['b1:s1', 'b2:s2'])
+})
+
+test("background: stopping by a name takes the named agent's nested children too", async ($, on) => {
+  const stored = trackTasks(on)
+  agentList(on, [{ id: 's1', name: 'lead' }, { id: 's2', parentId: 's1' }])
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  c.res.result = { task_id: 's1' }
+  await $.tool.call({ tool: 'TaskStop', task_id: 'lead' } as any)
+  await c.clock.advance(800)
+  expect(stored()).toEqual([])
+  expect(count(await bandOut($))).toBe(0)
+})
+
+test('background: TaskStop returns the tool result unchanged (success, deny, throwing agent.list)', async ($, on) => {
+  on('agent.list', () => {
+    throw new Error('boom')
+  })
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  const ok = { message: 'stopped', task_id: 's1', task_type: 'local_agent', command: 'x' }
+  c.res.result = ok
+  expect(await $.tool.call({ tool: 'TaskStop', task_id: 's1' } as any)).toEqual(expect.objectContaining({ result: ok }))
+  Object.keys(c.res).forEach(k => delete (c.res as any)[k])
+  Object.assign(c.res, { deny: 'nope' })
+  expect(await $.tool.call({ tool: 'TaskStop', task_id: 's2' } as any)).toEqual(expect.objectContaining({ deny: 'nope' }))
+})
+
+test('background: a subagent finishing normally keeps its shells (only TaskStop drops them)', async ($, on) => {
+  const stored = trackTasks(on)
+  const c = await bgBoot($, on)
+  await seedTwo($, c)
+  await c.clock.advance(3000)
+  expect(stored()).toEqual(['b1:s1', 'b2:s2'])
+  hasLabel(await bandOut($), `${LABELS.background} 2 tasks`)
+})

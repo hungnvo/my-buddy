@@ -633,7 +633,7 @@ const taskLabel = (kind: BuddyTask['kind'], e: unknown): string => {
 }
 
 // A Bash call that went to the background (run_in_background or ctrl+B) or a Monitor: a task outliving the call.
-async function onTaskStart($: Api, e: { tool: string }, result: unknown) {
+async function onTaskStart($: Api, e: { tool: string; agentId?: string }, result: unknown) {
   const r = (result as { result?: unknown; isError?: unknown } | undefined)
   if (!r || typeof r !== 'object' || r.isError || !r.result || typeof r.result !== 'object') return
   const out = r.result as { backgroundTaskId?: unknown; taskId?: unknown; backgroundEndsWithFinalResponse?: unknown; timeoutMs?: unknown; persistent?: unknown }
@@ -644,7 +644,7 @@ async function onTaskStart($: Api, e: { tool: string }, result: unknown) {
   const startedAt = await $.clock.now()
   const own = kind === 'monitor' && out.persistent !== true && typeof out.timeoutMs === 'number' && out.timeoutMs > 0
   const deadline = startedAt + (own ? (out.timeoutMs as number) + TASK_SLACK_MS : STALE_TASK_MS)
-  await addTask($, { id, kind, label: taskLabel(kind, e), startedAt, deadline })
+  await addTask($, { id, kind, label: taskLabel(kind, e), startedAt, deadline, ...(e.agentId ? { agentId: e.agentId } : {}) })
 }
 
 // Leveling: awards XP, and shows a short "+N" beside the buddy for the sources that ask for one.
@@ -853,10 +853,32 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     if (e.tool === 'TaskStop') {
       // Stopping a task ends it, whichever thread asked; a refused call stopped nothing.
-      const r = await next(e)
       const a = e as { task_id?: unknown; shell_id?: unknown }
-      const id = typeof a.task_id === 'string' && a.task_id ? a.task_id : typeof a.shell_id === 'string' ? a.shell_id : ''
-      if (id && !(r && 'deny' in r && r.deny)) await safe(() => dropTasks($, t => t.id === id))
+      const given = typeof a.task_id === 'string' && a.task_id ? a.task_id : typeof a.shell_id === 'string' ? a.shell_id : ''
+      // Read the agents before the stop: the stopped one may leave the list afterwards.
+      let agents: { id: string; name?: string; parentId?: string }[] = []
+      try {
+        const l = await $.agent.list()
+        if (Array.isArray(l)) agents = l
+      } catch {
+        // fall back to the id as given
+      }
+      const r = await next(e)
+      if (!(r && 'deny' in r && r.deny)) {
+        // The stop may have been addressed by a name: prefer the id the result resolved, then the agent list.
+        const res = (r as { result?: { task_id?: unknown } } | undefined)?.result
+        const resolved = res && typeof res === 'object' && typeof res.task_id === 'string' && res.task_id ? res.task_id : ''
+        const stopped = resolved || agents.find(g => g.id !== given && g.name === given && !agents.some(o => o.id === given))?.id || given
+        if (stopped) {
+          // A child agent is stopped with its parent: take every agent whose parentId chain reaches the stopped one.
+          const set = new Set<string>([stopped])
+          for (let grew = true; grew; ) {
+            grew = false
+            for (const g of agents) if (g.parentId && set.has(g.parentId) && !set.has(g.id)) set.add(g.id), (grew = true)
+          }
+          await safe(() => dropTasks($, t => t.id === stopped || t.id === given || (!!t.agentId && set.has(t.agentId))))
+        }
+      }
       return r
     }
     if (isHousekeeping(e.tool)) {

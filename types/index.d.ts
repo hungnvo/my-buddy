@@ -12,6 +12,8 @@ export type BuddyTask = {
   startedAt: number
   /** `$.clock.now()` milliseconds after which its end is presumed lost; absent in a value stored before `tasks-2` (8 hours) */
   deadline?: number
+  /** the subagent that started it; absent for the main thread and in a value stored before this field */
+  agentId?: string
 }
 
 export type BuddyView = {
