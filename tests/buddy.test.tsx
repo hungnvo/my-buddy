@@ -47,6 +47,12 @@ const engine = (on: any) =>
   })
 
 const drawn = async (ui: any) => JSON.stringify(await ui.drawn())
+// The harness stacks every plugin's band row (the test's own `engine` hook draws one too): this plugin's row alone.
+const mine = (out: string): string => {
+  const find = (n: any): any =>
+    !n || typeof n !== 'object' ? null : n.part?.plugin === 'my-buddy' ? n : (n.children ?? []).map(find).find(Boolean) ?? null
+  return JSON.stringify(find(JSON.parse(out)))
+}
 const count = (t: string) => (t.match(/"type":"Svg"/g) ?? []).length
 const run = ($: any, command: string) =>
   $.command.run({ command, args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
@@ -374,7 +380,7 @@ test('the band is hidden when idle, shows for a running sub, and a finished sub 
   await $.tool.call(sub('s1'))
   const shown = await drawn(ui)
   expect(count(shown)).toBe(2)
-  expect(shown).not.toMatch(/engine/)
+  expect(mine(shown)).not.toMatch(/engine/)
   await $.turn.complete(done('s1'))
   await clock.advance(5800) // main shows done, then idle
   const after = await drawn(ui)
@@ -597,7 +603,7 @@ test('the band stays up while idle once a reading exists, and hides when it lose
     expect(out).toMatch(/ctx/)
     expect(out).toMatch(/42k · 21%/)
     expect(out).toMatch(/idle/)
-    expect(out).not.toMatch(/engine/)
+    expect(mine(out)).not.toMatch(/engine/)
   }
   await measure($, { window: 200_000 })
   const out = await bandOut($)
@@ -1279,7 +1285,7 @@ test('terminal: the cache line joins the label row with one meter and never adds
   const one = await bandOutWith($, {}, 'terminal')
   expect(one).toContain('cache 60m')
   expect(one).toContain(' · ')
-  expect(one.match(/"flexDirection":"column"/g)?.length).toBe(2) // meters and right column, no cache row
+  expect(mine(one).match(/"flexDirection":"column"/g)?.length).toBe(2) // meters and right column, no cache row
   expect(await bandOutWith($, { maxRows: 1 }, 'terminal')).toContain('cache 60m')
   await tmeasure($, [{ kind: 'five_hour', percentUsed: 10 }, { kind: 'seven_day', percentUsed: 10 }], { tokens: 1000, window: 200_000 })
   const capped = await bandOutWith($, { maxRows: 1 }, 'terminal')
